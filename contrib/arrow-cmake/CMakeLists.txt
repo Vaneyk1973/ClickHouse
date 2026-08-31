@@ -25,9 +25,9 @@ if (NOT ENABLE_PARQUET)
 endif()
 
 # ORC lives here because Arrow has an adapter for it, but nothing about reading Parquet needs it.
-# It is also the only thing in the whole tree that runs `protoc`, and on a cross-compile that means
-# bootstrapping a native protobuf first, so turning it off is what makes a Parquet-only build cheap.
-option (ENABLE_ORC "Enable ORC (pulls in protobuf and, when cross-compiling, a native protoc)" ON)
+# It is also the only thing in the whole tree that runs `protoc`, and when a separate host build is
+# required that means bootstrapping a native protobuf first. Turning it off makes a Parquet-only build cheap.
+option (ENABLE_ORC "Enable ORC (pulls in protobuf and, when required, a native protoc)" ON)
 if (NOT ENABLE_ORC)
     message(STATUS "Not using ORC")
 endif()
@@ -77,7 +77,7 @@ set(ORC_BUILD_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/../orc/c++/include")
 set(ORC_ADDITION_SOURCE_DIR ${CMAKE_CURRENT_BINARY_DIR})
 set(ARROW_SRC_DIR "${ClickHouse_SOURCE_DIR}/contrib/arrow/cpp/src")
 
-if (NOT CMAKE_HOST_SYSTEM_NAME STREQUAL CMAKE_SYSTEM_NAME OR NOT CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL CMAKE_SYSTEM_PROCESSOR OR USE_MUSL)
+if (USE_SEPARATE_NATIVE_BUILD)
     set(PROTOBUF_EXECUTABLE "${PROJECT_BINARY_DIR}/native/contrib/google-protobuf-cmake/protoc")
     set(GRPC_EXECUTABLE "${PROJECT_BINARY_DIR}/native/contrib/grpc-cmake/grpc_cpp_plugin")
 else ()

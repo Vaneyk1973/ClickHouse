@@ -319,6 +319,24 @@ static struct InitFiu
     REGULAR(datalake_get_tables_throw) \
     REGULAR(datalake_simulate_missing_table_state) \
     PAUSEABLE_ONCE(drop_database_before_exclusive_ddl_lock) \
+    PAUSEABLE_ONCE(udt_lifecycle_pause_after_database_lookup) \
+    PAUSEABLE_ONCE(udt_table_alter_pause_before_authority_publication) \
+    PAUSEABLE_ONCE(udt_table_alter_pause_before_metadata_publication) \
+    ONCE(udt_authority_root_builder_allocation_failure) \
+    ONCE(udt_authority_root_builder_freeze_failure) \
+    ONCE(udt_authority_recovery_parse_failure) \
+    ONCE(udt_schema_storage_temp_write_failure) \
+    ONCE(udt_schema_storage_temp_sync_failure) \
+    ONCE(udt_schema_storage_temp_rename_failure) \
+    ONCE(udt_authority_prepared_publication_failure) \
+    PAUSEABLE_ONCE(udt_dictionary_repository_pause_after_live_admission) \
+    PAUSEABLE_ONCE(udt_authority_runtime_pause_after_publication_waiter_registration) \
+    PAUSEABLE_ONCE(udt_authority_verification_pause_before_cache_invalidation) \
+    PAUSEABLE_ONCE(udt_authority_shutdown_pause_before_fence) \
+    PAUSEABLE_ONCE(database_schema_mutation_pause_after_prepare) \
+    PAUSEABLE_ONCE(database_schema_mutation_pause_after_first_artifact_action) \
+    PAUSEABLE_ONCE(database_schema_mutation_pause_after_installation_barrier) \
+    PAUSEABLE_ONCE(database_schema_mutation_pause_after_commit) \
     PAUSEABLE_ONCE(create_or_replace_before_rename) \
     REGULAR(atomic_populate_fail_before_subscription) \
     PAUSEABLE(atomic_populate_pause_before_subscription) \

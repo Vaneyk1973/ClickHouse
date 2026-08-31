@@ -25,6 +25,13 @@
 namespace DB
 {
 
+namespace UDT
+{
+class IAuthorityAdapter;
+class ILifecycleAdapter;
+struct TypeAuthorityCapabilities;
+}
+
 
 struct Settings;
 struct ConstraintsDescription;
@@ -374,6 +381,10 @@ public:
     /// Is the database empty.
     virtual bool empty() const = 0;
 
+    /// Is the database empty of objects which must block DROP DATABASE.
+    /// Database-owned metadata removed by drop() may still block DETACH.
+    virtual bool emptyForDrop() const { return empty(); }
+
     virtual bool isReadOnly() const { return false; }
 
     /// Add the table to the database. Record its presence in the metadata.
@@ -423,6 +434,20 @@ public:
         const StorageID & /*table_id*/,
         const StorageInMemoryMetadata & /*metadata*/,
         bool validate_new_create_query);
+
+    /// Gives a database-owned metadata transaction a trusted opportunity to
+    /// reverse a just-committed ALTER boundary before the storage falls back to
+    /// an ordinary metadata rollback. `metadata_to_restore` may be rebound to
+    /// the exact durable successor package. The default means that no special
+    /// rollback was required or supported.
+    virtual bool rollbackUDTTableAlter(
+        ContextPtr /*context*/,
+        const StorageID & /*table_id*/,
+        StorageInMemoryMetadata & /*metadata_to_restore*/,
+        const StorageInMemoryMetadata & /*committed_metadata*/)
+    {
+        return false;
+    }
 
     /// Special method for ReplicatedMergeTree and DatabaseReplicated
     virtual bool canExecuteReplicatedMetadataAlter() const { return true; }
@@ -486,6 +511,19 @@ public:
 
     /// Get UUID of database.
     virtual UUID getUUID() const { return UUIDHelpers::Nil; }
+
+    /// Reports the tier this engine can activate. This is distinct from the
+    /// active adapter so a never-enabled database keeps its pre-UDT state.
+    virtual const UDT::TypeAuthorityCapabilities & getSupportedUDTAuthorityCapabilities() const noexcept;
+
+    /// Returns the active authority, or the process-stable unsupported
+    /// adapter while this database has no activated authority state.
+    virtual const UDT::IAuthorityAdapter & getUDTAuthorityAdapter() const noexcept;
+
+    /// Returns the database-owned definition-only lifecycle boundary. The default is
+    /// process-stable and fail-closed; it never infers support from an engine
+    /// name or from a metadata directory.
+    virtual UDT::ILifecycleAdapter & getUDTLifecycleAdapter() noexcept;
 
     virtual void renameDatabase(ContextPtr, const String & /*new_name*/);
 

@@ -8,6 +8,10 @@
 
 #if USE_LIBFIU
 
+/// libfiu includes <stdatomic.h> inside an extern "C" block. With libc++ in C++23 mode,
+/// that pulls C++ templates into C linkage. Parse the complete header with C++ linkage first.
+#  include <stdatomic.h>
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdocumentation"
 #pragma clang diagnostic ignored "-Wreserved-macro-identifier"

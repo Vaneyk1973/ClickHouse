@@ -3,13 +3,17 @@
 #include <Interpreters/InterpreterFactory.h>
 
 #include <Access/Common/AccessRightsElement.h>
+#include <Access/Common/UDTAccessTarget.h>
+#include <Access/UDTUsageAccess.h>
+#include <Analyzer/UDT/SelectedOutputTypeBindings.h>
 #include <Backups/BackupsWorker.h>
-#include <Common/typeid_cast.h>
-#include <Core/Settings.h>
 #include <Core/ServerSettings.h>
+#include <Core/Settings.h>
+#include <Databases/DatabaseAtomic.h>
 #include <Databases/DatabaseFactory.h>
 #include <Databases/DatabaseReplicated.h>
 #include <Databases/IDatabase.h>
+#include <Databases/UDT/AuthorityStorageOperationGate.h>
 #include <Interpreters/AddDefaultDatabaseVisitor.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -17,28 +21,40 @@
 #include <Interpreters/replaceLegacyToTime.h>
 #include <Interpreters/IdentifierSemantic.h>
 #include <Interpreters/InterpreterCreateQuery.h>
-#include <Interpreters/MutationsInterpreter.h>
+#include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/MutationsDateTimeLiteralVisitor.h>
+#include <Interpreters/MutationsInterpreter.h>
 #include <Interpreters/MutationsNonDeterministicHelpers.h>
 #include <Interpreters/QueryLog.h>
 #include <Interpreters/QueryMetadataCache.h>
+#include <Interpreters/UDT/StoredObjectTypeBindingPreparation.h>
+#include <Interpreters/UDT/StoredObjectTypeSupport.h>
+#include <Interpreters/UDT/UDTExecutionBoundary.h>
+#include <Interpreters/UDTScalarAliasColumnBinder.h>
 #include <Interpreters/executeDDLQueryOnCluster.h>
 #include <Parsers/ASTAlterQuery.h>
 #include <Parsers/ASTAssignment.h>
+#include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTIdentifier_fwd.h>
-#include <Parsers/ASTColumnDeclaration.h>
 #include <QueryPipeline/QueryPlanResourceHolder.h>
 #include <Storages/AlterCommands.h>
-#include <Storages/MutationCommands.h>
-#include <Storages/PartitionCommands.h>
-#include <Storages/ExecuteCommands.h>
-#include <Storages/StorageKeeperMap.h>
 #include <Storages/ColumnsDescription.h>
+#include <Storages/ExecuteCommands.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
+#include <Storages/MutationCommands.h>
+#include <Storages/PartitionCommands.h>
+#include <Storages/StorageKeeperMap.h>
+#include <Storages/StorageMaterializedView.h>
+#include <Common/typeid_cast.h>
+
+#include <algorithm>
+#include <limits>
+#include <unordered_map>
+#include <vector>
 
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionVisitor.h>
@@ -66,6 +82,8 @@ namespace Setting
     extern const SettingsUInt64 max_parser_depth;
     extern const SettingsUInt64 max_parser_backtracks;
     extern const SettingsBool use_legacy_to_time;
+    extern const SettingsBool allow_experimental_user_defined_types;
+    extern const SettingsBool allow_experimental_analyzer;
 }
 
 namespace ServerSetting
@@ -83,6 +101,8 @@ namespace ErrorCodes
     extern const int UNKNOWN_DATABASE;
     extern const int QUERY_IS_PROHIBITED;
     extern const int SUPPORT_IS_DISABLED;
+    extern const int UNKNOWN_TYPE;
+    extern const int ABORTED;
 }
 
 namespace
@@ -119,6 +139,8 @@ void normalizeLegacyToTimeInAlterMetadataDefinitions(ASTAlterQuery & alter)
 
 using CommandSegment = std::variant<AlterCommands, MutationCommands, PartitionCommands, ExecuteCommands>;
 using CommandSegments = std::vector<CommandSegment>;
+using PreparedUDTAlterColumns
+    = std::unordered_map<const ASTAlterCommand *, UDT::PersistedTypeReferences>;
 
 struct SegmentsHolder
 {
@@ -140,7 +162,11 @@ bool hasCommands(const CommandSegments & segments)
     return std::ranges::any_of(segments, [](const auto & segment) { return std::holds_alternative<CommandsType>(segment); });
 }
 
-CommandSegments parseAlterCommandSegments(const ASTAlterQuery & alter, const StoragePtr & table, const ContextPtr & context)
+CommandSegments parseAlterCommandSegments(
+    const ASTAlterQuery & alter,
+    const StoragePtr & table,
+    const ContextPtr & context,
+    const PreparedUDTAlterColumns & udt_columns)
 {
     SegmentsHolder segments_holder;
     const auto & settings = context->getSettingsRef();
@@ -154,6 +180,8 @@ CommandSegments parseAlterCommandSegments(const ASTAlterQuery & alter, const Sto
         }
         else if (auto alter_command = AlterCommand::parse(command_ast))
         {
+            if (const auto it = udt_columns.find(command_ast); it != udt_columns.end())
+                alter_command->udt_column_references = it->second;
             segments_holder.take<AlterCommands>().push_back(std::move(alter_command.value()));
         }
         else if (auto partition_command = PartitionCommand::parse(command_ast))
@@ -220,6 +248,352 @@ CommandSegments parseAlterCommandSegments(const ASTAlterQuery & alter, const Sto
     }
 
     return std::move(segments_holder.segments);
+}
+
+[[noreturn]] void rethrowUDTAlterBinderError(
+    const UDT::ScalarAliasColumnBinderError & error)
+{
+    using Code = UDT::ScalarAliasColumnBinderError::Code;
+    const int exception_code = [&]
+    {
+        switch (error.code)
+        {
+            case Code::UnknownDefinition: return ErrorCodes::UNKNOWN_TYPE;
+            case Code::InvalidInput:
+            case Code::CrossDatabaseReference: return ErrorCodes::BAD_ARGUMENTS;
+            case Code::UnsupportedColumnShape:
+            case Code::ParameterizedDefinition: return ErrorCodes::NOT_IMPLEMENTED;
+            case Code::AuthorityMismatch:
+            case Code::QueryChanged:
+            case Code::NormalizedSchemaMismatch:
+            case Code::InvalidState: return ErrorCodes::LOGICAL_ERROR;
+        }
+        return ErrorCodes::LOGICAL_ERROR;
+    }();
+    throw Exception(exception_code, "{}", error.what());
+}
+
+PreparedUDTAlterColumns prepareUDTAlterColumns(
+    ASTAlterQuery & alter,
+    const StorageID & table_id,
+    DatabaseAtomic & database,
+    const ContextPtr & context)
+{
+    PreparedUDTAlterColumns result;
+    const UDT::SchemaObjectID table_object{
+        .kind = UDT::SchemaObjectKind::Table,
+        .database_uuid = database.getUUID(),
+        .object_uuid = table_id.uuid,
+    };
+    std::vector<ASTAlterCommand *> commands;
+    std::vector<ASTColumnDeclaration *> declarations;
+    for (const auto & child : alter.command_list->children)
+    {
+        auto * command = child->as<ASTAlterCommand>();
+        if ((command->type != ASTAlterCommand::ADD_COLUMN && command->type != ASTAlterCommand::MODIFY_COLUMN)
+            || !command->col_decl)
+            continue;
+        auto & declaration = command->col_decl->as<ASTColumnDeclaration &>();
+        if (!UDT::hasReferencesInAlterColumn(declaration))
+            continue;
+        commands.push_back(command);
+        declarations.push_back(&declaration);
+    }
+
+    try
+    {
+        auto prepared = UDT::prepareScalarAliasAlterColumns(
+            declarations, table_id.database_name, context, database.getUDTAuthorityAdapter());
+        if (!prepared)
+            return result;
+        if (table_id.uuid == UUIDHelpers::Nil || database.getUUID() == UUIDHelpers::Nil)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UDT ALTER table identity is incomplete");
+        prepared->applyPhysicalTypeASTs();
+        auto fragments = std::move(*prepared).finishIndividualColumns(table_object, 1);
+        if (fragments.size() != commands.size())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UDT ALTER binder produced an unaligned fragment batch");
+        for (size_t index = 0; index < fragments.size(); ++index)
+        {
+            if (!fragments[index])
+                continue;
+            if (fragments[index]->uses.empty())
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "UDT ALTER binder produced an empty logical fragment");
+            result.emplace(commands[index], std::move(*fragments[index]));
+        }
+    }
+    catch (const UDT::ScalarAliasColumnBinderError & error)
+    {
+        rethrowUDTAlterBinderError(error);
+    }
+    return result;
+}
+
+[[noreturn]] void rethrowStoredObjectAlterBindingError(const UDT::StoredObjectTypeBindingPreparationError & error)
+{
+    using Code = UDT::StoredObjectTypeBindingPreparationError::Code;
+    const int exception_code = [&]
+    {
+        switch (error.code)
+        {
+            case Code::InvalidDeclaration:
+            case Code::InvalidObject:
+            case Code::CrossDatabaseReference:
+            case Code::LimitExceeded: return ErrorCodes::BAD_ARGUMENTS;
+            case Code::SourceSidecarMismatch:
+            case Code::QueryChanged:
+            case Code::NormalizedSchemaMismatch: return ErrorCodes::ABORTED;
+            case Code::InvalidDecision:
+            case Code::MissingLogicalBinding:
+            case Code::InvalidState: return ErrorCodes::LOGICAL_ERROR;
+        }
+        return ErrorCodes::LOGICAL_ERROR;
+    }();
+    throw Exception(exception_code, "{}", error.what());
+}
+
+void prepareMappedStoredObjectModifyQuery(
+    AlterCommands & commands,
+    const StoragePtr & storage,
+    const StorageMetadataPtr & metadata,
+    const ContextPtr & context,
+    bool require_boundary_handoff_target)
+{
+    if (!storage || !metadata || !context)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Mapped stored-object ALTER preparation has an incomplete input");
+    metadata->validateBoundUDTReferences();
+    const auto & bound = metadata->getBoundUDTReferences();
+    if (!bound || bound->getObject().kind != UDT::SchemaObjectKind::View)
+    {
+        if (require_boundary_handoff_target)
+        {
+            throw Exception(
+                ErrorCodes::ABORTED, "The mapped MaterializedView authorized by the DDL boundary changed before MODIFY QUERY preparation");
+        }
+        return;
+    }
+
+    AlterCommand * modify_query = nullptr;
+    for (auto & command : commands)
+    {
+        if (command.ignore || command.type != AlterCommand::MODIFY_QUERY)
+            continue;
+        if (modify_query)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Mapped MaterializedView ALTER supports one MODIFY QUERY command at a time");
+        modify_query = &command;
+    }
+    if (!modify_query)
+    {
+        if (require_boundary_handoff_target)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Mapped MaterializedView boundary handoff lost its MODIFY QUERY command");
+        return;
+    }
+
+    const auto * materialized_view = storage->as<StorageMaterializedView>();
+    if (!materialized_view || storage->getName() != "MaterializedView" || materialized_view->isRefreshable() || !modify_query->select)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Mapped MODIFY QUERY is supported only for a non-refreshable MaterializedView");
+    }
+    if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
+    {
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Mapped MaterializedView MODIFY QUERY requires the experimental analyzer for exact selected-output provenance");
+    }
+    const auto & before_expectation = metadata->getBoundUDTExpectation();
+    if (!before_expectation || before_expectation->object != bound->getObject()
+        || before_expectation->object_schema_revision != bound->getObjectSchemaRevision()
+        || before_expectation->object_schema_revision == std::numeric_limits<UInt64>::max())
+    {
+        throw Exception(ErrorCodes::ABORTED, "Mapped MaterializedView metadata has no exact successor revision");
+    }
+
+    const auto table_id = storage->getStorageID();
+    auto database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
+    auto * atomic = typeid_cast<DatabaseAtomic *>(database.get());
+    if (!atomic || typeid_cast<DatabaseReplicated *>(database.get()) || !atomic->hasActiveUDTAuthority()
+        || table_id.uuid == UUIDHelpers::Nil || bound->getObject().database_uuid != atomic->getUUID()
+        || bound->getObject().object_uuid != table_id.uuid)
+    {
+        throw Exception(ErrorCodes::ABORTED, "Mapped MaterializedView identity or Atomic authority changed before MODIFY QUERY");
+    }
+
+    auto collector = std::make_shared<UDT::SelectedOutputTypeBindingCollector>();
+    auto analysis_context = Context::createCopy(context);
+    analysis_context->setCurrentDatabase(table_id.database_name);
+    analysis_context->setUDTSelectedOutputTypeBindingCollector(collector);
+    auto select_options = SelectQueryOptions{}.analyze().createView().checkSubqueryTableAccess();
+    auto analyzed_header = InterpreterSelectQueryAnalyzer::getSampleBlock(modify_query->select->clone(), analysis_context, select_options);
+    auto collection = collector->take();
+    if (!collection)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Mapped MaterializedView analyzer did not publish selected-output provenance");
+
+    const auto physical_outputs = analyzed_header->getNamesAndTypesList();
+    if (materialized_view->hasInnerTable())
+    {
+        const auto inner_table = materialized_view->getTargetTable();
+        const auto inner_metadata = inner_table ? inner_table->getInMemoryMetadataPtr(context, false) : nullptr;
+        if (!inner_table || !inner_metadata || inner_metadata->getColumns().getAllPhysical() != physical_outputs)
+        {
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Mapped inner-table MaterializedView MODIFY QUERY requires an output schema exactly equal to its physical inner table");
+        }
+    }
+    UDT::SelectedOutputTypeBindings selected_outputs;
+    if (collection->kind == UDT::SelectedOutputTypeBindingCollectionKind::NoLogicalSourceFastPath)
+    {
+        selected_outputs.reserve(physical_outputs.size());
+        for (const auto & output : physical_outputs)
+        {
+            selected_outputs.push_back({
+                .output_name = output.name,
+                .physical_type = output.type,
+                .explicit_logical_tree = {},
+                .explicit_type_child_prefix = {},
+                .prebound_references = {},
+                .prebound_runtime_owner_key = {},
+                .prebound_type_child_prefix = {},
+            });
+        }
+    }
+    else if (collection->kind == UDT::SelectedOutputTypeBindingCollectionKind::CompleteBindings)
+    {
+        selected_outputs = std::move(collection->bindings);
+    }
+    else
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Mapped MaterializedView analyzer published an unknown provenance result");
+
+    if (selected_outputs.size() != physical_outputs.size())
+        throw Exception(ErrorCodes::ABORTED, "Mapped MaterializedView selected-output count changed during analysis");
+    auto physical = physical_outputs.begin();
+    for (const auto & selected : selected_outputs)
+    {
+        if (physical == physical_outputs.end() || !physical->type || !selected.isValid() || selected.output_name != physical->name
+            || !selected.physical_type->equals(*physical->type) || selected.physical_type->getName() != physical->type->getName())
+        {
+            throw Exception(ErrorCodes::ABORTED, "Mapped MaterializedView selected-output proof differs from its physical header");
+        }
+        ++physical;
+    }
+
+    try
+    {
+        auto handoff = UDT::prepareStoredObjectSelectedOutputAlterBindings(
+            modify_query->select,
+            UDT::StoredObjectKind::MaterializedView,
+            bound->getObject(),
+            before_expectation->object_schema_revision + 1,
+            table_id.database_name,
+            context,
+            atomic->getUDTAuthorityAdapter(),
+            selected_outputs);
+        if (handoff.getObjectKind() != UDT::StoredObjectKind::MaterializedView
+            || handoff.getSourceMode() != UDT::StoredObjectSourceMode::AsSelect || handoff.getObject() != bound->getObject()
+            || !handoff.usesSelectedOutputClassification())
+        {
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Mapped MaterializedView ALTER handoff changed its closed preparation route");
+        }
+        handoff.applyPhysicalTypeASTs();
+        auto prepared = std::move(handoff).releaseViewBindings();
+        const bool mapped = static_cast<bool>(prepared.persisted_references);
+        if (prepared.physical_outputs != physical_outputs || mapped != static_cast<bool>(prepared.bound_physical_schema)
+            || mapped != static_cast<bool>(prepared.sidecar_expectation) || mapped != !prepared.dependency_edges.empty())
+        {
+            throw Exception(ErrorCodes::ABORTED, "Mapped MaterializedView MODIFY QUERY produced an incomplete exact binding package");
+        }
+        if (mapped
+            && (prepared.persisted_references->object != bound->getObject()
+                || prepared.persisted_references->object_schema_revision != before_expectation->object_schema_revision + 1
+                || prepared.persisted_references->physical_schema_fingerprint != prepared.physical_schema_fingerprint
+                || prepared.bound_physical_schema->physical_schema_fingerprint != prepared.physical_schema_fingerprint
+                || prepared.sidecar_expectation->physical_schema_fingerprint != prepared.physical_schema_fingerprint))
+        {
+            throw Exception(ErrorCodes::ABORTED, "Mapped MaterializedView MODIFY QUERY sidecar identity changed during preparation");
+        }
+        if (mapped && !context->getSettingsRef()[Setting::allow_experimental_user_defined_types])
+        {
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Mapped MaterializedView MODIFY QUERY cannot retain logical user-defined type outputs while "
+                "allow_experimental_user_defined_types is disabled");
+        }
+
+        if (prepared.persisted_references)
+        {
+            std::vector<UDT::AccessTarget> access_targets;
+            access_targets.reserve(prepared.persisted_references->descriptors.size());
+            for (const auto & descriptor : prepared.persisted_references->descriptors)
+            {
+                const auto & identity = descriptor.getDefinitionIdentity();
+                if (identity.database_uuid != bound->getObject().database_uuid || identity.type_uuid == UUIDHelpers::Nil
+                    || !identity.revision)
+                {
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Mapped MaterializedView binding contains an invalid descriptor identity");
+                }
+                access_targets.push_back({
+                    .database_uuid = identity.database_uuid,
+                    .type_uuid = identity.type_uuid,
+                });
+            }
+            UDT::checkUsageAccess(context, access_targets);
+        }
+
+        modify_query->udt_stored_object_rebind_prepared = true;
+        modify_query->udt_stored_object_physical_outputs = std::move(prepared.physical_outputs);
+        modify_query->udt_stored_object_references = std::move(prepared.persisted_references);
+    }
+    catch (const UDT::StoredObjectTypeBindingPreparationError & error)
+    {
+        rethrowStoredObjectAlterBindingError(error);
+    }
+    catch (const UDT::ScalarAliasColumnBinderError & error)
+    {
+        rethrowUDTAlterBinderError(error);
+    }
+}
+
+bool hasUDTAlterColumns(const ASTAlterQuery & alter)
+{
+    for (const auto & child : alter.command_list->children)
+    {
+        const auto * command = child->as<ASTAlterCommand>();
+        if ((command->type == ASTAlterCommand::ADD_COLUMN || command->type == ASTAlterCommand::MODIFY_COLUMN)
+            && command->col_decl
+            && UDT::hasReferencesInAlterColumn(
+                command->col_decl->as<ASTColumnDeclaration &>()))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+DatabaseAtomic & validateUDTAlterSurface(
+    IDatabase & database,
+    const StoragePtr & table)
+{
+    auto * atomic = typeid_cast<DatabaseAtomic *>(&database);
+    if (!atomic || typeid_cast<DatabaseReplicated *>(&database))
+    {
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "UDT table ALTER requires a local Atomic database");
+    }
+    if (!table)
+        throw Exception(ErrorCodes::UNKNOWN_TABLE, "UDT ALTER table does not exist");
+    const String engine_name = table->getName();
+    const bool supported_engine = (engine_name == "Memory" && !table->storesDataOnDisk())
+        || (table->isMergeTree() && table->storesDataOnDisk() && !table->isSharedStorage()
+            && !engine_name.starts_with("Replicated") && !engine_name.starts_with("Shared"));
+    if (!supported_engine)
+    {
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "UDT table ALTER supports only Memory and non-replicated, non-shared MergeTree-family tables");
+    }
+    if (!atomic->hasActiveUDTAuthority())
+        throw Exception(ErrorCodes::UNKNOWN_TYPE, "Unknown user-defined type in ALTER TABLE column declaration");
+    return *atomic;
 }
 
 void validateSegmentsCombination(CommandSegments & segments)
@@ -331,13 +705,16 @@ std::optional<BlockIO> tryRewriteToLightweightUpdate(CommandSegments & segments,
 
     LOG_DEBUG(getLogger("InterpreterAlterQuery"), "Will execute query '{}' as a lightweight update", query_ptr->formatForErrorMessage());
 
+    const auto metadata = table->getInMemoryMetadataPtr(context, true);
+    UDT::assertAuthorityStorageNewOperationAllowed(*table, metadata, UDT::AuthorityQuarantineOperationKind::Mutation);
     BlockIO res;
     res.pipeline = table->updateLightweight(mutation_commands, context);
     res.pipeline.addStorageHolder(table);
     return res;
 }
 
-BlockIO runCommandSegments(CommandSegments & segments, const StoragePtr & table, const ContextPtr & context)
+BlockIO runCommandSegments(
+    CommandSegments & segments, const StoragePtr & table, const ContextPtr & context, bool require_mapped_modify_query_boundary_handoff)
 {
     BlockIO res;
     const auto & settings = context->getSettingsRef();
@@ -356,6 +733,7 @@ BlockIO runCommandSegments(CommandSegments & segments, const StoragePtr & table,
                 cache->clear();
             }
             auto metadata_snapshot = table->getInMemoryMetadataPtr(context, /*bypass_metadata_cache=*/ false);
+            UDT::assertAuthorityStorageNewOperationAllowed(*table, metadata_snapshot, UDT::AuthorityQuarantineOperationKind::DDL);
             alter_commands->validate(table, context);
 
             bool share_nested = true;
@@ -363,6 +741,8 @@ BlockIO runCommandSegments(CommandSegments & segments, const StoragePtr & table,
                 share_nested = (*merge_tree->getSettings())[MergeTreeSetting::share_nested_offsets];
 
             alter_commands->prepare(*metadata_snapshot, share_nested);
+            prepareMappedStoredObjectModifyQuery(
+                *alter_commands, table, metadata_snapshot, context, require_mapped_modify_query_boundary_handoff);
             table->checkAlterIsPossible(*alter_commands, context);
             table->alter(*alter_commands, context, alter_lock);
         }
@@ -371,6 +751,7 @@ BlockIO runCommandSegments(CommandSegments & segments, const StoragePtr & table,
             if (mutation_commands->hasNonEmptyMutationCommands())
             {
                 auto metadata_snapshot = table->getInMemoryMetadataPtr(context, true);
+                UDT::assertAuthorityStorageNewOperationAllowed(*table, metadata_snapshot, UDT::AuthorityQuarantineOperationKind::Mutation);
                 table->checkMutationIsPossible(*mutation_commands, settings);
                 /// Replicated-storage non-determinism check must always run, even when
                 /// `validate_mutation_query=0` — bypassing it would let nondeterministic mutations
@@ -389,6 +770,17 @@ BlockIO runCommandSegments(CommandSegments & segments, const StoragePtr & table,
         else if (auto * partition_commands = std::get_if<PartitionCommands>(&segment))
         {
             auto metadata_snapshot = table->getInMemoryMetadataPtr(context, true);
+            const bool attaches_parts = std::ranges::any_of(
+                *partition_commands,
+                [](const PartitionCommand & command)
+                {
+                    return command.type == PartitionCommand::ATTACH_PARTITION || command.type == PartitionCommand::FETCH_PARTITION
+                        || command.type == PartitionCommand::REPLACE_PARTITION;
+                });
+            UDT::assertAuthorityStorageNewOperationAllowed(
+                *table,
+                metadata_snapshot,
+                attaches_parts ? UDT::AuthorityQuarantineOperationKind::Attach : UDT::AuthorityQuarantineOperationKind::DDL);
             table->checkAlterPartitionIsPossible(*partition_commands, metadata_snapshot, settings, context);
             auto partition_commands_pipe = table->alterPartition(metadata_snapshot, *partition_commands, context);
             if (!partition_commands_pipe.empty())
@@ -396,6 +788,8 @@ BlockIO runCommandSegments(CommandSegments & segments, const StoragePtr & table,
         }
         else if (auto * execute_commands = std::get_if<ExecuteCommands>(&segment))
         {
+            const auto metadata_snapshot = table->getInMemoryMetadataPtr(context, true);
+            UDT::assertAuthorityStorageNewOperationAllowed(*table, metadata_snapshot, UDT::AuthorityQuarantineOperationKind::DDL);
             for (const auto * execute_command : *execute_commands)
             {
                 ASTPtr args_ast = execute_command->execute_args ? execute_command->execute_args->ptr() : nullptr;
@@ -411,12 +805,32 @@ BlockIO runCommandSegments(CommandSegments & segments, const StoragePtr & table,
 
 }
 
-InterpreterAlterQuery::InterpreterAlterQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_) : WithMutableContext(context_), query_ptr(query_ptr_)
+InterpreterAlterQuery::InterpreterAlterQuery(
+    const ASTPtr & query_ptr_,
+    ContextMutablePtr context_,
+    std::shared_ptr<UDT::UDTStoredObjectDDLSelectBoundaryHandoff> udt_stored_object_ddl_select_boundary_handoff_)
+    : WithMutableContext(context_)
+    , query_ptr(query_ptr_)
+    , udt_stored_object_ddl_select_boundary_handoff(std::move(udt_stored_object_ddl_select_boundary_handoff_))
 {
 }
 
 BlockIO InterpreterAlterQuery::execute()
 {
+    if (udt_stored_object_ddl_select_boundary_handoff)
+    {
+        auto * alter = query_ptr ? query_ptr->as<ASTAlterQuery>() : nullptr;
+        if (!alter || !alter->command_list || alter->command_list->children.size() != 1)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Stored-object DDL boundary handoff has no exact ALTER MODIFY QUERY owner");
+        auto * command = alter->command_list->children.front()->as<ASTAlterCommand>();
+        if (!command || command->type != ASTAlterCommand::MODIFY_QUERY || !command->select)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Stored-object DDL boundary handoff lost its ALTER MODIFY QUERY SELECT child");
+        udt_stored_object_ddl_select_boundary_handoff->consumeForAlter(*alter, *command->select);
+        udt_stored_object_ddl_select_boundary_handoff.reset();
+        udt_stored_object_ddl_select_boundary_consumed = true;
+    }
+
+    getContext()->setRejectStoredUDTSyntaxInSQLUDFBodies();
     FunctionNameNormalizer::visit(query_ptr.get());
     auto & alter = query_ptr->as<ASTAlterQuery &>();
 
@@ -426,6 +840,28 @@ BlockIO InterpreterAlterQuery::execute()
     }
     if (alter.alter_object == ASTAlterQuery::AlterObjectType::TABLE)
     {
+        const auto command_list_owners = std::count_if(
+            query_ptr->children.begin(),
+            query_ptr->children.end(),
+            [&](const ASTPtr & child) { return child.get() == alter.command_list; });
+        if (!alter.command_list || command_list_owners != 1
+            || std::any_of(
+                alter.command_list->children.begin(),
+                alter.command_list->children.end(),
+                [](const ASTPtr & child) { return !child || !child->as<ASTAlterCommand>(); }))
+        {
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "ALTER TABLE has a malformed command AST");
+        }
+
+        /// Audit the complete retained definition graph before any command
+        /// child is interpreted or distributed. The exact replacement repeats
+        /// the body check against the cloned definition image.
+        if (!UserDefinedSQLFunctionFactory::instance().empty())
+        {
+            UserDefinedSQLFunctionVisitor::assertNoStoredUDTSyntaxInFunctionBodiesToReplace(query_ptr, getContext());
+            UserDefinedSQLFunctionVisitor::visit(query_ptr, getContext(), /*reject_stored_udt_syntax_in_function_bodies=*/true);
+        }
+        getContext()->setStoredObjectSQLUDFSubstitutionFrozen();
         return executeToTable(alter);
     }
 
@@ -448,19 +884,52 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
     BlockIO res;
     const auto & settings = getContext()->getSettingsRef();
 
-    if (!UserDefinedSQLFunctionFactory::instance().empty())
-        UserDefinedSQLFunctionVisitor::visit(query_ptr, getContext());
+    /// This predicate must run before every distributed-DDL fast path. Older
+    /// DDL envelopes cannot carry the operation-bound UDT snapshot/USAGE
+    /// result and must never enqueue reference-bearing ALTER commands.
+    const bool has_udt_columns = hasUDTAlterColumns(alter);
+    if (has_udt_columns)
+    {
+        if (!settings[Setting::allow_experimental_user_defined_types])
+        {
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "User-defined type table columns are disabled; enable allow_experimental_user_defined_types to use them");
+        }
+        if (!alter.cluster.empty())
+        {
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "User-defined type table columns do not support ALTER TABLE ON CLUSTER");
+        }
+    }
 
     if (getContext()->getSettingsRef()[Setting::use_legacy_to_time])
         normalizeLegacyToTimeInAlterMetadataDefinitions(query_ptr->as<ASTAlterQuery &>());
 
     auto table_id = getContext()->tryResolveStorageID(alter);
     StoragePtr table;
+    bool alters_mapped_udt_object = false;
 
     if (table_id)
     {
         query_ptr->as<ASTAlterQuery &>().setDatabase(table_id.database_name);
         table = DatabaseCatalog::instance().tryGetTable(table_id, getContext());
+    }
+
+    if (table)
+    {
+        const auto metadata = table->getInMemoryMetadataPtr(getContext(), true);
+        metadata->validateBoundUDTReferences();
+        alters_mapped_udt_object = static_cast<bool>(metadata->getBoundUDTReferences());
+        UDT::assertAuthorityStorageNewOperationAllowed(*table, metadata, UDT::AuthorityQuarantineOperationKind::DDL);
+    }
+
+    if (alters_mapped_udt_object && !alter.cluster.empty())
+    {
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Mapped stored-object ALTER does not support ON CLUSTER without an operation-bound sidecar protocol");
     }
 
     if (!alter.cluster.empty() && !maybeRemoveOnCluster(query_ptr, getContext()))
@@ -491,6 +960,35 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
         throw Exception(ErrorCodes::UNKNOWN_DATABASE, "Database {} does not exist", backQuoteIfNeed(alter.getDatabase()));
 
     DatabasePtr database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
+    UDT::assertAuthorityOwnedInnerStorageOperationAllowed(table, "ALTER");
+    if (udt_stored_object_ddl_select_boundary_consumed)
+    {
+        if (!table)
+            throw Exception(ErrorCodes::UNKNOWN_TABLE, "Could not find table: {}", table_id.table_name);
+
+        const auto metadata = table->getInMemoryMetadataPtr(getContext(), true);
+        metadata->validateBoundUDTReferences();
+        const auto & bound = metadata->getBoundUDTReferences();
+        const auto * materialized_view = table->as<StorageMaterializedView>();
+        auto * atomic = typeid_cast<DatabaseAtomic *>(database.get());
+        const auto & storage_id = table->getStorageID();
+        if (!bound || bound->getObject().kind != UDT::SchemaObjectKind::View || !materialized_view || table->getName() != "MaterializedView"
+            || materialized_view->isRefreshable() || !atomic || typeid_cast<DatabaseReplicated *>(database.get())
+            || !atomic->hasActiveUDTAuthority() || storage_id.uuid == UUIDHelpers::Nil
+            || bound->getObject().database_uuid != atomic->getUUID() || bound->getObject().object_uuid != storage_id.uuid)
+        {
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "A UDT-bearing ALTER MODIFY QUERY is supported only for an exactly mapped non-refreshable "
+                "MaterializedView in a local Atomic authority");
+        }
+    }
+    if (has_udt_columns && database->shouldReplicateQuery(getContext(), query_ptr))
+    {
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Replicated database ALTER is not supported for user-defined type table columns");
+    }
     if (database->shouldReplicateQuery(getContext(), query_ptr))
     {
         auto guard = DatabaseCatalog::instance().getDDLGuard(table_id.database_name, table_id.table_name, database.get());
@@ -499,6 +997,12 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
     }
 
 #if CLICKHOUSE_CLOUD
+    if (has_udt_columns && SharedDatabaseCatalog::shouldReplicateQuery(getContext(), query_ptr))
+    {
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Shared database ALTER is not supported for user-defined type table columns");
+    }
     if (SharedDatabaseCatalog::shouldReplicateQuery(getContext(), query_ptr))
     {
         return SharedDatabaseCatalog::instance().tryExecuteDDLQuery(query_ptr, getContext());
@@ -507,6 +1011,10 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
 
     if (!table)
         throw Exception(ErrorCodes::UNKNOWN_TABLE, "Could not find table: {}", table_id.table_name);
+
+    DatabaseAtomic * udt_database = nullptr;
+    if (has_udt_columns)
+        udt_database = &validateUDTAlterSurface(*database, table);
 
     checkStorageSupportsTransactionsIfNeeded(table, getContext());
     if (table->isStaticStorage())
@@ -535,7 +1043,13 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
     ASTPtr command_list_ptr = alter.command_list->ptr();
     visitor.visit(command_list_ptr);
 
-    auto segments = parseAlterCommandSegments(alter, table, getContext());
+    PreparedUDTAlterColumns udt_columns;
+    if (udt_database)
+    {
+        udt_columns = prepareUDTAlterColumns(
+            query_ptr->as<ASTAlterQuery &>(), table_id, *udt_database, getContext());
+    }
+    auto segments = parseAlterCommandSegments(alter, table, getContext(), udt_columns);
     validateSegmentsCombination(segments);
     validateMutationsAllowed(segments, database, getContext());
     validateReplicatedDatabaseSegments(segments, database);
@@ -550,7 +1064,7 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
         return std::move(lightweight_result.value());
     }
 
-    return runCommandSegments(segments, table, getContext());
+    return runCommandSegments(segments, table, getContext(), udt_stored_object_ddl_select_boundary_consumed);
 }
 
 BlockIO InterpreterAlterQuery::executeToDatabase(const ASTAlterQuery & alter)
@@ -986,10 +1500,8 @@ void InterpreterAlterQuery::extendQueryLogElemImpl(QueryLogElement & elem, const
 void registerInterpreterAlterQuery(InterpreterFactory & factory);
 void registerInterpreterAlterQuery(InterpreterFactory & factory)
 {
-    auto create_fn = [] (const InterpreterFactory::Arguments & args)
-    {
-        return std::make_unique<InterpreterAlterQuery>(args.query, args.context);
-    };
+    auto create_fn = [](const InterpreterFactory::Arguments & args)
+    { return std::make_unique<InterpreterAlterQuery>(args.query, args.context, args.udt_stored_object_ddl_select_boundary_handoff); };
     factory.registerInterpreter("InterpreterAlterQuery", create_fn);
 }
 

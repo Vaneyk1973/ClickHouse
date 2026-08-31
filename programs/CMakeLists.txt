@@ -231,8 +231,8 @@ add_custom_target (clickhouse-bundle ALL DEPENDS ${CLICKHOUSE_BUNDLE})
 if (USE_BINARY_HASH)
     add_dependencies(clickhouse hash-binary)
 
-    # When cross-compiling, use the native-built hash-binary; otherwise use the regular build output
-    if (CMAKE_CROSSCOMPILING)
+    # Use the separate host `hash-binary` when build-time tools cannot use target instrumentation.
+    if (USE_SEPARATE_NATIVE_BUILD)
         set(HASH_BINARY_PATH "${PROJECT_BINARY_DIR}/native/utils/hash-binary/hash-binary")
     else()
         set(HASH_BINARY_PATH "$<TARGET_FILE:hash-binary>")

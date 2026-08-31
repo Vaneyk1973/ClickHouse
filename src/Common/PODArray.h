@@ -310,11 +310,13 @@ public:
     void assertNotIntersects(It1 from_begin [[maybe_unused]], It2 from_end [[maybe_unused]])
     {
 #if !defined(NDEBUG)
+        if (from_begin == from_end)
+            return;
+
         const char * ptr_begin = reinterpret_cast<const char *>(&*from_begin);
         const char * ptr_end = reinterpret_cast<const char *>(&*from_end);
 
-        /// Also it's safe if the range is empty.
-        chassert(!((ptr_begin >= c_start && ptr_begin < c_end) || (ptr_end > c_start && ptr_end <= c_end)) || (ptr_begin == ptr_end));
+        chassert(!((ptr_begin >= c_start && ptr_begin < c_end) || (ptr_end > c_start && ptr_end <= c_end)));
 #endif
     }
 

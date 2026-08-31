@@ -18,7 +18,7 @@ DROP TABLE IF EXISTS mv;
 CREATE TABLE src (id UInt64) ENGINE = MergeTree ORDER BY id;
 INSERT INTO src SELECT number FROM numbers(1000);
 CREATE MATERIALIZED VIEW mv ENGINE = MergeTree ORDER BY id POPULATE AS SELECT id FROM src;
-SELECT 'mergetree_pr', count(), uniqExact(id), sum(id) FROM mv;
+SELECT 'mergetree_pr', count(), uniqExact(id), sum(id) FROM mv SETTINGS enable_parallel_replicas = 0;
 DROP TABLE mv;
 DROP TABLE src;
 
@@ -30,6 +30,6 @@ DROP TABLE IF EXISTS mv;
 CREATE TABLE src_repl (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/04494_src', 'r1') ORDER BY id;
 INSERT INTO src_repl SELECT number FROM numbers(1000);
 CREATE MATERIALIZED VIEW mv ENGINE = MergeTree ORDER BY id POPULATE AS SELECT id FROM src_repl;
-SELECT 'replicated_pr', count(), uniqExact(id), sum(id) FROM mv;
+SELECT 'replicated_pr', count(), uniqExact(id), sum(id) FROM mv SETTINGS enable_parallel_replicas = 0;
 DROP TABLE mv;
 DROP TABLE src_repl SYNC;

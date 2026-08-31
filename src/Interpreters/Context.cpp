@@ -3,6 +3,7 @@
 #include <set>
 #include <optional>
 #include <memory>
+#include <Analyzer/UDT/SelectedOutputTypeBindings.h>
 #include <Poco/UUID.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Poco/Util/Application.h>
@@ -83,6 +84,7 @@
 #include <Interpreters/Cache/QueryConditionCache.h>
 #include <Interpreters/Cache/QueryResultCache.h>
 #include <Interpreters/Cache/ReverseLookupCache.h>
+#include <Interpreters/UDT/QueryResultCacheStorageDependencies.h>
 #include <Interpreters/ContextTimeSeriesTagsCollector.h>
 #include <Interpreters/SessionTracker.h>
 #include <Interpreters/WasmModuleManager.h>
@@ -1422,7 +1424,13 @@ ContextData::ContextData(const ContextData &o) :
     access(o.access),
     need_recalculate_access(o.need_recalculate_access),
     current_database(o.current_database),
-    can_use_query_result_cache(o.can_use_query_result_cache),
+    can_use_query_result_cache(o.can_use_query_result_cache.load(std::memory_order_acquire)),
+    query_result_cache_blocked_by_udt(o.query_result_cache_blocked_by_udt.load(std::memory_order_acquire)),
+    udt_selected_output_binding_collector(o.udt_selected_output_binding_collector),
+    udt_stored_expression_type_references(o.udt_stored_expression_type_references),
+    reject_stored_udt_syntax_in_sql_udf_bodies(o.reject_stored_udt_syntax_in_sql_udf_bodies),
+    stored_object_sql_udf_substitution_frozen(o.stored_object_sql_udf_substitution_frozen),
+    udt_query_result_cache_storage_dependency_collector(o.udt_query_result_cache_storage_dependency_collector),
     settings(std::make_unique<Settings>(*o.settings)),
     progress_callback(o.progress_callback),
     file_progress_callback(o.file_progress_callback),
@@ -3427,6 +3435,17 @@ StoragePtr Context::executeTableFunction(
     }
 
     return res;
+}
+
+StoragePtr Context::tryGetCachedASTTableFunctionResult(const ASTPtr & table_expression) const
+{
+    if (!table_expression)
+        return {};
+
+    const auto key = toString(table_expression->getTreeHash(/*ignore_aliases=*/ true));
+    std::lock_guard lock(table_function_results_mutex);
+    const auto it = table_function_results.find(key);
+    return it == table_function_results.end() ? StoragePtr{} : it->second;
 }
 
 
@@ -5529,12 +5548,108 @@ void Context::clearCaches() const
 
 void Context::setCanUseQueryResultCache(bool can_use_query_result_cache_)
 {
-    can_use_query_result_cache = can_use_query_result_cache_;
+    if (!can_use_query_result_cache_ || query_result_cache_blocked_by_udt.load(std::memory_order_acquire))
+    {
+        can_use_query_result_cache.store(false, std::memory_order_release);
+        return;
+    }
+
+    can_use_query_result_cache.store(true, std::memory_order_release);
+    /// Close the race with a concurrent monotonic block published between the
+    /// first check and the enable store. Readers also treat the block bit as
+    /// authoritative, so no cache admission can observe an enabled blocked
+    /// context.
+    if (query_result_cache_blocked_by_udt.load(std::memory_order_acquire))
+        can_use_query_result_cache.store(false, std::memory_order_release);
 }
 
 bool Context::getCanUseQueryResultCache() const
 {
-    return can_use_query_result_cache;
+    return can_use_query_result_cache.load(std::memory_order_acquire) && !query_result_cache_blocked_by_udt.load(std::memory_order_acquire);
+}
+
+void Context::setQueryResultCacheBlockedByUDT() const
+{
+    query_result_cache_blocked_by_udt.store(true, std::memory_order_release);
+    can_use_query_result_cache.store(false, std::memory_order_release);
+}
+
+bool Context::isQueryResultCacheBlockedByUDT() const
+{
+    return query_result_cache_blocked_by_udt.load(std::memory_order_acquire);
+}
+
+void Context::setUDTSelectedOutputTypeBindingCollector(std::shared_ptr<UDT::SelectedOutputTypeBindingCollector> collector)
+{
+    udt_selected_output_binding_collector = std::move(collector);
+}
+
+std::shared_ptr<UDT::SelectedOutputTypeBindingCollector> Context::getUDTSelectedOutputTypeBindingCollector() const
+{
+    return udt_selected_output_binding_collector;
+}
+
+void Context::setUDTStoredExpressionTypeReferences(std::shared_ptr<const UDT::BoundObjectTypeReferences> references)
+{
+    udt_stored_expression_type_references = std::move(references);
+}
+
+std::shared_ptr<const UDT::BoundObjectTypeReferences> Context::getUDTStoredExpressionTypeReferences() const
+{
+    return udt_stored_expression_type_references;
+}
+
+void Context::setRejectStoredUDTSyntaxInSQLUDFBodies(bool reject)
+{
+    reject_stored_udt_syntax_in_sql_udf_bodies = reject;
+}
+
+bool Context::shouldRejectStoredUDTSyntaxInSQLUDFBodies() const
+{
+    return reject_stored_udt_syntax_in_sql_udf_bodies;
+}
+
+void Context::setStoredObjectSQLUDFSubstitutionFrozen(bool frozen)
+{
+    stored_object_sql_udf_substitution_frozen = frozen;
+}
+
+bool Context::isStoredObjectSQLUDFSubstitutionFrozen() const
+{
+    return stored_object_sql_udf_substitution_frozen;
+}
+
+void Context::initializeUDTQueryResultCacheStorageDependencyCollector(bool boundary_saw_storage_reference, UInt8 contextual_sink_candidates)
+{
+    if (udt_query_result_cache_storage_dependency_collector)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UDT query-result-cache storage dependency collector was initialized twice");
+    udt_query_result_cache_storage_dependency_collector
+        = std::make_shared<UDT::QueryResultCacheStorageDependencyCollector>(boundary_saw_storage_reference, contextual_sink_candidates);
+}
+
+void Context::setUDTQueryResultCacheStorageDependencyCollector(std::shared_ptr<UDT::QueryResultCacheStorageDependencyCollector> collector)
+{
+    if (udt_query_result_cache_storage_dependency_collector && udt_query_result_cache_storage_dependency_collector != collector)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot replace a query-result-cache storage dependency collector");
+    udt_query_result_cache_storage_dependency_collector = std::move(collector);
+}
+
+std::shared_ptr<UDT::QueryResultCacheStorageDependencyCollector> Context::getUDTQueryResultCacheStorageDependencyCollector() const
+{
+    return udt_query_result_cache_storage_dependency_collector;
+}
+
+bool Context::tryBeginUDTQueryResultCacheStorageDependencyResolution(const void * owner) const
+{
+    if (udt_query_result_cache_storage_dependency_collector)
+        return udt_query_result_cache_storage_dependency_collector->tryBeginResolution(owner);
+    return false;
+}
+
+void Context::markUDTQueryResultCacheStorageDependencyResolutionComplete(const void * owner) const
+{
+    if (udt_query_result_cache_storage_dependency_collector)
+        udt_query_result_cache_storage_dependency_collector->markResolutionComplete(owner);
 }
 
 void Context::setAsynchronousMetrics(AsynchronousMetrics * asynchronous_metrics_)

@@ -8,6 +8,11 @@
 namespace DB
 {
 
+namespace UDT
+{
+class UDTStoredObjectDDLSelectBoundaryHandoff;
+}
+
 class AccessRightsElements;
 class ASTAlterCommand;
 class ASTAlterQuery;
@@ -19,7 +24,10 @@ class ASTAlterQuery;
 class InterpreterAlterQuery : public IInterpreter, WithMutableContext
 {
 public:
-    InterpreterAlterQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_);
+    InterpreterAlterQuery(
+        const ASTPtr & query_ptr_,
+        ContextMutablePtr context_,
+        std::shared_ptr<UDT::UDTStoredObjectDDLSelectBoundaryHandoff> udt_stored_object_ddl_select_boundary_handoff_ = {});
 
     BlockIO execute() override;
 
@@ -47,6 +55,8 @@ private:
     BlockIO executeToDatabase(const ASTAlterQuery & alter);
 
     ASTPtr query_ptr;
+    std::shared_ptr<UDT::UDTStoredObjectDDLSelectBoundaryHandoff> udt_stored_object_ddl_select_boundary_handoff;
+    bool udt_stored_object_ddl_select_boundary_consumed = false;
 };
 
 }

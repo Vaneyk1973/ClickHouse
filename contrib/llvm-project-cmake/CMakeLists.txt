@@ -306,15 +306,20 @@ set(LLVM_COMPILE_DEFINITIONS
 )
 
 #
-# Cross-compilation support for tablegen tools
+# Separate host build for tablegen tools
 #
-# When cross-compiling, we need to build tablegen for the HOST system (not target).
-# The tablegen executables must be runnable on the build machine to generate .inc files.
+# Tablegen executables run during the build to generate .inc files. Cross-compilation
+# therefore needs host binaries rather than target binaries. MemorySanitizer builds
+# need the same separation: an instrumented `llvm-min-tblgen` reports errors during
+# LLVM's static initialization before it can generate `GenVT.inc`. Build these tools
+# as a separate unsanitized Release project while keeping target LLVM instrumented.
 #
-# We detect cross-compilation by checking CMAKE_CROSSCOMPILING.
-#
-if (CMAKE_CROSSCOMPILING)
-    message(STATUS "LLVM: Cross-compiling detected, building native tablegen tools")
+if (CMAKE_CROSSCOMPILING OR (SANITIZE STREQUAL "memory"))
+    if (CMAKE_CROSSCOMPILING)
+        message(STATUS "LLVM: Cross-compiling detected, building separate Release host tablegen tools")
+    else()
+        message(STATUS "LLVM: MemorySanitizer build detected, building separate Release host tablegen tools")
+    endif()
 
     include(ExternalProject)
 
@@ -342,7 +347,7 @@ if (CMAKE_CROSSCOMPILING)
     )
 
     # Paths to native tablegen executables
-    # Note: native-tblgen builds for the host (not the cross-compilation target),
+    # Note: `native-tblgen` builds for the host (not the instrumented or cross-compilation target),
     # so we do not append CMAKE_EXECUTABLE_SUFFIX (which is the target's suffix).
     set(LLVM_TABLEGEN_EXE "${NATIVE_TBLGEN_BUILD_DIR}/llvm-tblgen")
     set(LLVM_MIN_TABLEGEN_EXE "${NATIVE_TBLGEN_BUILD_DIR}/llvm-min-tblgen")
@@ -356,8 +361,7 @@ if (CMAKE_CROSSCOMPILING)
     set_target_properties(llvm-min-tblgen-native PROPERTIES IMPORTED_LOCATION "${LLVM_MIN_TABLEGEN_EXE}")
     add_dependencies(llvm-min-tblgen-native native-tblgen-build)
 
-    # We still need dummy targets for non-cross builds that expect these
-    # But tablegen commands will use the imported targets
+    # Tablegen commands use the imported host targets.
     set(TABLEGEN_TARGET llvm-tblgen-native)
     set(MIN_TABLEGEN_TARGET llvm-min-tblgen-native)
     set(USE_NATIVE_TABLEGEN ON)
@@ -369,8 +373,7 @@ else()
 endif()
 
 #
-# Build llvm-min-tblgen and llvm-tblgen (only for native builds)
-# For cross-compilation, these are built by ExternalProject above.
+# Build `llvm-min-tblgen` and `llvm-tblgen` inline when separate host tools are unnecessary.
 #
 if (NOT USE_NATIVE_TABLEGEN)
 
@@ -580,7 +583,7 @@ endif() # NOT USE_NATIVE_TABLEGEN
 # Set up tablegen executable variables
 #
 if (USE_NATIVE_TABLEGEN)
-    # For cross-compilation: use native (host) tablegen
+    # Use the separately built host tablegen.
     set(LLVM_TABLEGEN_DEPENDS native-tblgen-build)
     # The executable path is set above as LLVM_TABLEGEN_EXE
 else()
@@ -591,8 +594,8 @@ else()
 endif()
 
 #
-# For cross-compilation: Copy GenVT.inc from native build
-# (For native compilation, llvm_gen_vt is defined inside the if (NOT USE_NATIVE_TABLEGEN) block above)
+# Copy `GenVT.inc` from the separate host build.
+# (For inline builds, `llvm_gen_vt` is defined inside the `NOT USE_NATIVE_TABLEGEN` block above.)
 #
 if (USE_NATIVE_TABLEGEN)
     set(NATIVE_GENVT_INC "${NATIVE_TBLGEN_BUILD_DIR}/include/llvm/CodeGen/GenVT.inc")
