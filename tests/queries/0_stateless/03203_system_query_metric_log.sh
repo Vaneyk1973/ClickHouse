@@ -1,4 +1,5 @@
 #!/bin/bash
+# Tags: no-parallel
 
 # This test depends A LOT on timing, so it's very sensitive when the system is overloaded. For that
 # reason, margins of 20% were added initially. They've been increased over time in an attempt to
@@ -18,7 +19,39 @@ $CLICKHOUSE_CLIENT --query-id="${query_prefix}_fast" -q "SELECT sleep(0.1) SETTI
 
 wait
 
-$CLICKHOUSE_CLIENT -q "SYSTEM FLUSH LOGS query_log, query_metric_log"
+# Global SYSTEM FLUSH LOGS waits for the moving offsets of the whole log
+# queues. Wide log batches can take several minutes under MSan, even when the
+# rows produced by this test are already durable. Wait for the exact rows this
+# test needs instead.
+readonly log_rows_deadline=$((SECONDS + 480))
+while true; do
+    ready=$($CLICKHOUSE_CLIENT --log_queries=0 -q "
+        SELECT uniqExact(query_finishes.query_id) = 3
+        FROM
+        (
+            SELECT query_id, max(event_time_microseconds) AS finish_time
+            FROM system.query_log
+            WHERE event_date >= yesterday()
+              AND event_time >= now() - 600
+              AND current_database = currentDatabase()
+              AND query_id IN ('${query_prefix}_1000', '${query_prefix}_400', '${query_prefix}_123')
+              AND type = 'QueryFinish'
+            GROUP BY query_id
+        ) AS query_finishes
+        INNER JOIN system.query_metric_log AS metrics
+            ON metrics.query_id = query_finishes.query_id
+           AND metrics.event_time_microseconds = query_finishes.finish_time
+        WHERE metrics.event_date >= yesterday() AND metrics.event_time >= now() - 600
+    " 2>/dev/null || true)
+    if [[ $ready == 1 ]]; then
+        break
+    fi
+    if ((SECONDS >= log_rows_deadline)); then
+        echo "query_log/query_metric_log rows did not appear within 480 seconds" >&2
+        exit 1
+    fi
+    sleep 1
+done
 
 function check_log()
 {

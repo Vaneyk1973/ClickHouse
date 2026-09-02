@@ -25,3 +25,13 @@ clickhouse_add_microbenchmark(profile_events
 clickhouse_add_microbenchmark(benchmark_sched_getcpu
     SOURCES sched_getcpu.cpp
     LIBRARIES ${CMAKE_DL_LIBS})
+
+clickhouse_add_microbenchmark(benchmark_udt_physicalization_token_masking
+    SOURCES udt_physicalization_token_masking.cpp
+    LIBRARIES dbms)
+
+if (EXISTS "${ClickHouse_SOURCE_DIR}/src/Parsers/ASTCastTarget.h")
+    target_compile_definitions(benchmark_udt_physicalization_token_masking_objects PRIVATE CLICKHOUSE_UDT_TOKEN_MASKING_BENCHMARK=1)
+else()
+    target_compile_definitions(benchmark_udt_physicalization_token_masking_objects PRIVATE CLICKHOUSE_UDT_TOKEN_MASKING_BENCHMARK=0)
+endif()

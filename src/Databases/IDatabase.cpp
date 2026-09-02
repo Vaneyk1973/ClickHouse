@@ -1,16 +1,18 @@
 #include <memory>
+#include <DataTypes/UDT/IAuthorityAdapter.h>
 #include <Databases/IDatabase.h>
 #include <Databases/RenderedCreateQuery.h>
+#include <Databases/UDT/ILifecycleAdapter.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/TableNameHints.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Storages/IStorage.h>
+#include <Common/AsyncLoader.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
 #include <Common/NamePrompter.h>
 #include <Common/quoteString.h>
-#include <Common/AsyncLoader.h>
 
 
 namespace CurrentMetrics
@@ -102,6 +104,21 @@ IDatabase::IDatabase(String database_name_) : database_name(std::move(database_n
 IDatabase::~IDatabase()
 {
     CurrentMetrics::sub(CurrentMetrics::AttachedDatabase, 1);
+}
+
+const UDT::TypeAuthorityCapabilities & IDatabase::getSupportedUDTAuthorityCapabilities() const noexcept
+{
+    return UDT::getUnsupportedAuthorityAdapter().getCapabilities();
+}
+
+const UDT::IAuthorityAdapter & IDatabase::getUDTAuthorityAdapter() const noexcept
+{
+    return UDT::getUnsupportedAuthorityAdapter();
+}
+
+UDT::ILifecycleAdapter & IDatabase::getUDTLifecycleAdapter() noexcept
+{
+    return UDT::getUnsupportedLifecycleAdapter();
 }
 
 void IDatabase::alterDatabaseComment(const AlterCommand & /*command*/, ContextPtr /*query_context*/)

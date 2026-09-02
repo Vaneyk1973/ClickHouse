@@ -1,9 +1,9 @@
-# Native build for llvm-tblgen tools
-# This is used when cross-compiling to build tablegen for the host system
+# Separate host build for `llvm-tblgen` tools
+# This is used for cross-compilation and MemorySanitizer builds.
 #
-# This CMakeLists.txt is invoked by ExternalProject_Add from the main CMakeLists.txt
-# It builds llvm-min-tblgen and llvm-tblgen without the target sysroot, making them
-# runnable on the host system.
+# This file is invoked by `ExternalProject_Add` from the main `CMakeLists.txt`.
+# It builds `llvm-min-tblgen` and `llvm-tblgen` without the target sysroot or parent
+# sanitizer flags, making them runnable on the host system during the build.
 
 cmake_minimum_required(VERSION 3.20)
 project(llvm-native-tblgen CXX C ASM)
@@ -64,7 +64,7 @@ file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include/llvm/Config")
 
 #
 # Platform-specific config variables for the HOST system
-# Note: native-tblgen builds for the host, so we use CMAKE_HOST_SYSTEM_NAME.
+# Note: `native-tblgen` is a separate host-tool build, so we use `CMAKE_HOST_SYSTEM_NAME`.
 # We do not attempt to detect musl here: ClickHouse CI hosts are always glibc,
 # and if someone builds on a musl host the missing headers will fail clearly.
 #

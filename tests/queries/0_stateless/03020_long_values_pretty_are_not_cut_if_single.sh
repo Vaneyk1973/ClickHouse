@@ -11,7 +11,14 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Make sure that system.metric_log exists
 ${CLICKHOUSE_CLIENT} --query "SELECT 1 FORMAT Null"
-${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS metric_log"
+metric_log_deadline=$((SECONDS + 120))
+while [[ $(${CLICKHOUSE_CLIENT} --query "EXISTS TABLE system.metric_log" 2>/dev/null) != 1 ]]; do
+    if ((SECONDS >= metric_log_deadline)); then
+        echo "system.metric_log was not created within 120 seconds" >&2
+        exit 1
+    fi
+    sleep 1
+done
 
 
 ${CLICKHOUSE_CLIENT} --output-format-pretty-multiline-fields 0 --output_format_pretty_fallback_to_vertical 0 --query "SHOW CREATE TABLE system.metric_log" --format Pretty | grep -P '^COMMENT'

@@ -1,10 +1,5 @@
 
-if (NOT(
-        CMAKE_HOST_SYSTEM_NAME STREQUAL CMAKE_SYSTEM_NAME
-        AND CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL CMAKE_SYSTEM_PROCESSOR
-        AND NOT USE_MUSL
-    )
-)
+if (USE_SEPARATE_NATIVE_BUILD)
     set (COMPRESSOR "${PROJECT_BINARY_DIR}/native/utils/self-extracting-executable/pre_compressor")
     set (DECOMPRESSOR "--decompressor=${PROJECT_BINARY_DIR}/utils/self-extracting-executable/decompressor")
 else ()

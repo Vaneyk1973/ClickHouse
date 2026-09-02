@@ -4,17 +4,17 @@
 
 #if USE_ROCKSDB
 
-#include <Storages/MergeTree/UniqueKey/UniqueKeyProbe.h>
-#include <Storages/MergeTree/UniqueKey/UniqueKeyProbeSimple.h>
-#include <Storages/MergeTree/UniqueKey/UniqueKeySSTProbe.h>
-#include <Storages/MergeTree/UniqueKey/SSTIndexWriter.h>
-#include <Storages/MergeTree/UniqueKey/UniqueKeyEncoding.h>
-#include <Storages/MergeTree/UniqueKey/DeleteBitmap.h>
+#include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/DataPartStorageOnDiskFull.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
-#include <Storages/KeyDescription.h>
+#include <Storages/MergeTree/UniqueKey/DeleteBitmap.h>
+#include <Storages/MergeTree/UniqueKey/SSTIndexWriter.h>
+#include <Storages/MergeTree/UniqueKey/UniqueKeyEncoding.h>
+#include <Storages/MergeTree/UniqueKey/UniqueKeyProbe.h>
+#include <Storages/MergeTree/UniqueKey/UniqueKeyProbeSimple.h>
+#include <Storages/MergeTree/UniqueKey/UniqueKeySSTProbe.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/StorageMergeTree.h>
 
@@ -26,9 +26,9 @@
 #include <Core/Names.h>
 #include <Core/SettingsEnums.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <IO/SharedThreadPools.h>
 #include <Interpreters/Context.h>
 #include <Parsers/ASTFunction.h>
-#include <IO/SharedThreadPools.h>
 #include <Common/tests/gtest_global_context.h>
 
 #include <rocksdb/env.h>
@@ -51,46 +51,45 @@ using namespace DB;
 
 namespace
 {
-    constexpr size_t MAX_ENC = 256;
+constexpr size_t MAX_ENC = 256;
 
-    Block makeKeyBlock(const std::vector<UInt64> & keys)
-    {
-        auto col = ColumnUInt64::create();
-        for (UInt64 k : keys)
-            col->insertValue(k);
-        Block b;
-        b.insert({std::move(col), std::make_shared<DataTypeUInt64>(), "key"});
-        return b;
-    }
-
-    /// Encode one UInt64 key with the same encoder the SST writer uses.
-    String encodeKey(UInt64 k)
-    {
-        auto col = ColumnUInt64::create();
+Block makeKeyBlock(const std::vector<UInt64> & keys)
+{
+    auto col = ColumnUInt64::create();
+    for (UInt64 k : keys)
         col->insertValue(k);
-        Columns cols{std::move(col)};
-        VectorWithMemoryTracking<String> out;
-        UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, MAX_ENC, out);
-        return out.at(0);
-    }
+    Block b;
+    b.insert({std::move(col), std::make_shared<DataTypeUInt64>(), "key"});
+    return b;
+}
 
-    /// Write a single (encoded_key -> raw value) SST entry, bypassing
-    /// `SSTIndexWriter` — used only to inject a malformed (non-4-byte) value the
-    /// real writer cannot produce, for the corrupt-sidecar test.
-    bool writeSSTRawValue(const String & path, const String & encoded_key, const String & value)
-    {
-        rocksdb::Options options;
-        rocksdb::BlockBasedTableOptions tbl;
-        tbl.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10.0));
-        options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
-        rocksdb::SstFileWriter writer(rocksdb::EnvOptions(), options);
-        if (!writer.Open(path).ok())
-            return false;
-        if (!writer.Put(rocksdb::Slice(encoded_key.data(), encoded_key.size()),
-                        rocksdb::Slice(value.data(), value.size())).ok())
-            return false;
-        return writer.Finish().ok();
-    }
+/// Encode one UInt64 key with the same encoder the SST writer uses.
+String encodeKey(UInt64 k)
+{
+    auto col = ColumnUInt64::create();
+    col->insertValue(k);
+    Columns cols{std::move(col)};
+    VectorWithMemoryTracking<String> out;
+    UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, MAX_ENC, out);
+    return out.at(0);
+}
+
+/// Write a single (encoded_key -> raw value) SST entry, bypassing
+/// `SSTIndexWriter` — used only to inject a malformed (non-4-byte) value the
+/// real writer cannot produce, for the corrupt-sidecar test.
+bool writeSSTRawValue(const String & path, const String & encoded_key, const String & value)
+{
+    rocksdb::Options options;
+    rocksdb::BlockBasedTableOptions tbl;
+    tbl.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10.0));
+    options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
+    rocksdb::SstFileWriter writer(rocksdb::EnvOptions(), options);
+    if (!writer.Open(path).ok())
+        return false;
+    if (!writer.Put(rocksdb::Slice(encoded_key.data(), encoded_key.size()), rocksdb::Slice(value.data(), value.size())).ok())
+        return false;
+    return writer.Finish().ok();
+}
 }
 
 /// Fixture: owns a temp disk for the test's SST sidecars (kept alive for the
@@ -107,8 +106,7 @@ protected:
 
     void SetUp() override
     {
-        base = std::filesystem::temp_directory_path()
-            / ("gtest_uk_probe_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
+        base = std::filesystem::temp_directory_path() / ("gtest_uk_probe_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
         std::filesystem::remove_all(base);
         std::filesystem::create_directories(base);
         disk = std::make_shared<DiskLocal>("test_disk", base.string());
@@ -136,8 +134,7 @@ protected:
     /// Build an SST-backed probe target from `(key -> row)` entries (written via
     /// the real `SSTIndexWriter`), with `dead_rows` marked dead in the part's
     /// delete bitmap.
-    ProbeTargetPartPtr makeTarget(
-        std::vector<std::pair<UInt64, UInt32>> kv, std::vector<UInt64> dead_rows = {})
+    ProbeTargetPartPtr makeTarget(std::vector<std::pair<UInt64, UInt32>> kv, std::vector<UInt64> dead_rows = {})
     {
         const String part_dir = "part_" + std::to_string(counter++);
         std::filesystem::create_directories(base / part_dir);
@@ -166,14 +163,10 @@ protected:
 
     UniqueKeyProbeSimple probeOver(ProbeTargetsSnapshot snapshot)
     {
-        return UniqueKeyProbeSimple(
-            [snapshot](const String &) { return snapshot; }, Names{"key"}, MAX_ENC);
+        return UniqueKeyProbeSimple([snapshot](const String &) { return snapshot; }, Names{"key"}, MAX_ENC);
     }
 
-    static ProbeResult probeKey(IUniqueKeyProbe & probe, UInt64 key)
-    {
-        return probe.probeBatch(makeKeyBlock({key}), "p0").at(0);
-    }
+    static ProbeResult probeKey(IUniqueKeyProbe & probe, UInt64 key) { return probe.probeBatch(makeKeyBlock({key}), "p0").at(0); }
 };
 
 /// ---------- reduction over real SST targets ----------
@@ -204,10 +197,10 @@ TEST_F(UniqueKeyProbeTest, SinglePartAllDead)
     EXPECT_EQ(probeKey(probe, 7).outcome, ProbeOutcome::FOUND_ALL_DEAD);
 }
 
-TEST_F(UniqueKeyProbeTest, NewestLiveWinsOverOlder)
+TEST_F(UniqueKeyProbeTest, NewestLiveWinsOverOlderDead)
 {
     auto newest = makeTarget({{5, 9}});
-    auto older = makeTarget({{5, 1}});
+    auto older = makeTarget({{5, 1}}, /*dead_rows=*/{1});
     ASSERT_NE(newest, nullptr);
     ASSERT_NE(older, nullptr);
     auto probe = probeOver({newest, older}); /// newest-first
@@ -281,8 +274,7 @@ TEST_F(UniqueKeyProbeTest, FindRowIndexBatchHitsExactKeyOnly)
     /// compare must reject it.
     const String e20 = encodeKey(20);
     const String e30 = encodeKey(30);
-    std::vector<std::string_view> views{
-        {e20.data(), e20.size()}, {e30.data(), e30.size()}};
+    std::vector<std::string_view> views{{e20.data(), e20.size()}, {e30.data(), e30.size()}};
     std::vector<std::optional<UInt64>> out;
     t->findRowIndexBatch(views, out);
 
@@ -386,9 +378,10 @@ TEST_F(UniqueKeyProbeTest, DecodedRowOutOfPartBoundsThrows)
     std::filesystem::create_directories(base / part_dir);
     constexpr UInt32 PART_ROWS = 3;
     /// The directory is pre-created above, so `OpenExisting` matches what this test was written against.
-    auto part = MergeTreeDataPartBuilder(*storage, "all_1_1_0", volume, "", part_dir, context->getReadSettings(), PartDirIntent::OpenExisting)
-                    .withBytesAndRows(0, PART_ROWS, 0)
-                    .build();
+    auto part
+        = MergeTreeDataPartBuilder(*storage, "all_1_1_0", volume, "", part_dir, context->getReadSettings(), PartDirIntent::OpenExisting)
+              .withBytesAndRows(0, PART_ROWS, 0)
+              .build();
     part->rows_count = PART_ROWS;
 
     /// Seed an SST whose single entry's value decodes to row 5 — past the

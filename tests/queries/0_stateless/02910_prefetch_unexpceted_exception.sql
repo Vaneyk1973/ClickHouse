@@ -14,6 +14,10 @@ INSERT INTO prefetched_table SELECT rand(), randomString(5) from numbers(1000);
 INSERT INTO prefetched_table SELECT rand(), randomString(5) from numbers(1000);
 
 SET local_filesystem_read_prefetch=1;
+-- The default can be switched to 'pread' when RWF_NOWAIT is unavailable (for
+-- example under a container seccomp profile); this test specifically needs the
+-- asynchronous local reader in order to exercise its prefetched pool.
+SET local_filesystem_read_method='pread_threadpool';
 SET allow_prefetched_read_pool_for_remote_filesystem=1;
 SET allow_prefetched_read_pool_for_local_filesystem=1;
 
