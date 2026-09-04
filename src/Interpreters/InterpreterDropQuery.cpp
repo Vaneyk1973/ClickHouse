@@ -648,8 +648,8 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
 
     /// Database DETACH prepares and shuts down its tables in bulk before the
     /// per-table detach callbacks below. Acquire every table ALTER lock in a
-    /// stable order, then retain the Atomic schema lock until catalog detach.
-    /// This both rejects an existing mapped table before side effects and
+    /// stable order, then retain the Atomic schema lock through all per-table
+    /// work. This both rejects an existing mapped table before side effects and
     /// prevents a physical table from becoming mapped while those effects run.
     std::vector<StoragePtr> atomic_database_detach_tables;
     std::vector<IStorage::AlterLockHolder> atomic_database_detach_alter_locks;
@@ -1077,7 +1077,14 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
 
     /// DETACH or DROP database itself. If TRUNCATE skip dropping/erasing the database.
     if (!truncate)
+    {
+        /// The exclusive database DDL guard now prevents new tables or schema
+        /// mutations. Release the UDT schema guard before catalog detach:
+        /// DatabaseAtomic::shutdown() enters the same mutex while draining its
+        /// authority runtime, so retaining it here would self-deadlock.
+        atomic_database_detach_guard.reset();
         DatabaseCatalog::instance().detachDatabase(getContext(), database_name, drop, database->shouldBeEmptyOnDetach());
+    }
 
     return {};
 }

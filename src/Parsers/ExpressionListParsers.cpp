@@ -4087,7 +4087,7 @@ Action ParserExpressionImpl::tryParseOperator(Layers & layers, IParser::Pos & po
     if (op.type == OperatorType::Cast)
     {
         ParsedCastDataType parsed_type;
-        if (!parseCastDataType(pos, parsed_type, expected))
+        if (!parseCastDataType(pos, parsed_type, expected, CastDataTypeParseMode::PostfixOperator))
             return Action::NONE;
 
         layers.back()->pushOperand(createCastTypeArgument(std::move(parsed_type)));

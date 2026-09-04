@@ -1061,6 +1061,23 @@ void StorageMaterializedView::mutate(const MutationCommands & commands, ContextP
 
 void StorageMaterializedView::renameInMemory(const StorageID & new_table_id)
 {
+    const auto no_op = [] {};
+    renameInMemoryImpl(new_table_id, no_op, no_op);
+}
+
+void StorageMaterializedView::renameInMemoryWithNestedTableCallbacks(
+    const StorageID & new_table_id,
+    const std::function<void()> & before_nested_table_rename,
+    const std::function<void()> & after_nested_table_rename)
+{
+    renameInMemoryImpl(new_table_id, before_nested_table_rename, after_nested_table_rename);
+}
+
+void StorageMaterializedView::renameInMemoryImpl(
+    const StorageID & new_table_id,
+    const std::function<void()> & before_nested_table_rename,
+    const std::function<void()> & after_nested_table_rename)
+{
     auto old_table_id = getStorageID();
     auto inner_table_id = getTargetTableId();
     bool from_atomic_to_atomic_database = old_table_id.hasUUID() && new_table_id.hasUUID();
@@ -1074,7 +1091,17 @@ void StorageMaterializedView::renameInMemory(const StorageID & new_table_id)
         auto rename = make_intrusive<ASTRenameQuery>();
         rename->addElement(inner_table_id.database_name, inner_table_id.table_name, new_table_id.database_name, new_target_table_name);
 
-        InterpreterRenameQuery(rename, getContext()).execute();
+        before_nested_table_rename();
+        try
+        {
+            InterpreterRenameQuery(rename, getContext()).execute();
+        }
+        catch (...)
+        {
+            after_nested_table_rename();
+            throw;
+        }
+        after_nested_table_rename();
         updateTargetTableId(new_table_id.database_name, new_target_table_name);
     }
 

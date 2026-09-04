@@ -70,6 +70,7 @@ namespace UDT
 class BoundObjectTypeReferences;
 class QueryResultCacheStorageDependencyCollector;
 class SelectedOutputTypeBindingCollector;
+using TableFunctionStorageObserver = std::function<void(const ASTPtr &, const StoragePtr &, const String &)>;
 }
 
 class ASTSelectQuery;
@@ -315,6 +316,15 @@ struct ServerSettings;
 struct StorageInMemoryMetadata;
 using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 
+namespace UDT
+{
+using AliasResolutionObserver = std::function<void(
+    const StorageID & source_alias_id,
+    const StoragePtr & target,
+    const StorageID & target_id_at_observation,
+    const StorageMetadataPtr & metadata)>;
+}
+
 struct StorageSnapshot;
 using StorageSnapshotPtr = std::shared_ptr<StorageSnapshot>;
 
@@ -405,6 +415,14 @@ protected:
     /// Optional DDL-owned sink for one stable analyzer selected-output proof.
     /// Null for every ordinary query and built-in-only inference fast path.
     std::shared_ptr<UDT::SelectedOutputTypeBindingCollector> udt_selected_output_binding_collector;
+    /// Query-scoped handoff of exact table-function storages produced during
+    /// inferred-schema analysis. Copies share the observer so nested and
+    /// SQL-security-overridden analysis cannot lose an invocation.
+    std::shared_ptr<UDT::TableFunctionStorageObserver> udt_table_function_storage_observer;
+    /// Query-scoped handoff of exact target identity and metadata observed
+    /// while Alias resolves its virtual schema. Context copies share the
+    /// callback so nested analysis preserves the same observation stream.
+    std::shared_ptr<UDT::AliasResolutionObserver> udt_alias_resolution_observer;
     /// Exact immutable V2 sidecar for one trusted View inner-query generation.
     /// ASTFunction runtime ordinals select StoredExpression endpoints without
     /// reopening the catalog or scanning the stored query during analysis.
@@ -1679,6 +1697,15 @@ public:
     void setQueryResultCacheBlockedByUDT() const;
     void setUDTSelectedOutputTypeBindingCollector(std::shared_ptr<UDT::SelectedOutputTypeBindingCollector> collector);
     std::shared_ptr<UDT::SelectedOutputTypeBindingCollector> getUDTSelectedOutputTypeBindingCollector() const;
+    void setUDTTableFunctionStorageObserver(std::shared_ptr<UDT::TableFunctionStorageObserver> observer);
+    std::shared_ptr<UDT::TableFunctionStorageObserver> getUDTTableFunctionStorageObserver() const;
+    void observeUDTTableFunctionStorage(const ASTPtr & invocation, const StoragePtr & storage) const
+    {
+        if (udt_table_function_storage_observer)
+            (*udt_table_function_storage_observer)(invocation, storage, getCurrentDatabase());
+    }
+    void setUDTAliasResolutionObserver(std::shared_ptr<UDT::AliasResolutionObserver> observer);
+    std::shared_ptr<UDT::AliasResolutionObserver> getUDTAliasResolutionObserver() const;
 
     void setUDTStoredExpressionTypeReferences(std::shared_ptr<const UDT::BoundObjectTypeReferences> references);
     std::shared_ptr<const UDT::BoundObjectTypeReferences> getUDTStoredExpressionTypeReferences() const;

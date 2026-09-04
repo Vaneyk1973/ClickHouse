@@ -45,6 +45,36 @@ void expectStringLiteralTarget(const String & expression, const String & expecte
     EXPECT_EQ(literal->value.safeGet<String>(), expected_target) << expression;
 }
 
+void expectPostfixJSONPath(const String & expression, const std::vector<String> & path)
+{
+    const auto ast = parseExpression(expression);
+    ASTPtr current = ast;
+    for (auto component = path.rbegin(); component != path.rend(); ++component)
+    {
+        const auto * tuple_element = current->as<ASTFunction>();
+        ASSERT_NE(tuple_element, nullptr) << expression;
+        ASSERT_EQ(tuple_element->name, "tupleElement") << expression;
+        ASSERT_NE(tuple_element->arguments, nullptr) << expression;
+        ASSERT_EQ(tuple_element->arguments->children.size(), 2) << expression;
+
+        const auto * field = tuple_element->arguments->children[1]->as<ASTLiteral>();
+        ASSERT_NE(field, nullptr) << expression;
+        ASSERT_EQ(field->value.getType(), Field::Types::String) << expression;
+        EXPECT_EQ(field->value.safeGet<String>(), *component) << expression;
+        current = tuple_element->arguments->children[0];
+    }
+
+    const auto * cast = getCastFunction(current);
+    ASSERT_NE(cast, nullptr) << expression;
+    EXPECT_EQ(cast->tryGetStructuredCastTarget(), nullptr) << expression;
+    ASSERT_NE(cast->arguments, nullptr) << expression;
+    ASSERT_EQ(cast->arguments->children.size(), 2) << expression;
+    const auto * target = cast->arguments->children[1]->as<ASTLiteral>();
+    ASSERT_NE(target, nullptr) << expression;
+    ASSERT_EQ(target->value.getType(), Field::Types::String) << expression;
+    EXPECT_EQ(target->value.safeGet<String>(), "JSON") << expression;
+}
+
 }
 
 TEST(UDTCastTarget, QualifiedTargetSurvivesEveryTypeSyntaxPath)
@@ -80,6 +110,17 @@ TEST(UDTCastTarget, BuiltInTargetsKeepStringLiteralShape)
     expectStringLiteralTarget("CAST(1, 'Enum8(\\'a.b\\' = 1)')", "Enum8('a.b' = 1)");
 
     EXPECT_EQ(parseExpression("CAST(1 AS UInt64)")->formatWithSecretsOneLine(), "CAST(1, 'UInt64')");
+}
+
+TEST(UDTCastTarget, PostfixJSONPathRemainsOutsideTheCastTarget)
+{
+    expectPostfixJSONPath("'{}'::JSON.a", {"a"});
+    expectPostfixJSONPath("materialize('{}')::JSON.a.b", {"a", "b"});
+
+    const auto quoted_database = parseExpression("1::`JSON`.a");
+    const auto * cast = getCastFunction(quoted_database);
+    ASSERT_NE(cast, nullptr);
+    EXPECT_NE(cast->tryGetStructuredCastTarget(), nullptr);
 }
 
 TEST(UDTCastTarget, CloneHashFormatAndColumnNameRoundTrip)

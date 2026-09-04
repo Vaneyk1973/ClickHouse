@@ -195,6 +195,7 @@ public:
             return;
         }
 
+        saw_resolved_storage_reference = true;
         QueryResultCacheStorageDependency dependency{storage_id, std::move(engine_name), kind, std::move(udt_binding)};
         const auto existing = dependencies.find(dependency);
         if (existing != dependencies.end())
@@ -241,6 +242,32 @@ public:
         retained_bytes += dependency_bytes;
     }
 
+    /// Analyzer-created table-function storages such as numbers() and eval()
+    /// have no catalog UUID to revalidate. They are nevertheless a complete
+    /// physical boundary observation when they carry no persisted UDT binding
+    /// or authority continuation evidence. Keep them out of the dependency
+    /// vector while recording that the syntactic storage reference was
+    /// resolved; UUID-bearing and UDT-bearing storages must use record().
+    void recordResolvedTransientTableFunction(
+        const StorageID & storage_id,
+        const String & engine_name,
+        const BoundObjectTypeReferences::Ptr & bound_references,
+        const AuthorityStorageReadContinuationEvidence::Ptr & exact_root_evidence = {})
+    {
+        std::lock_guard lock(mutex);
+        if (!proof_complete)
+            return;
+        if (storage_id.hasUUID() || engine_name.empty() || bound_references || exact_root_evidence)
+        {
+            proof_complete = false;
+            resolution_complete = false;
+            return;
+        }
+
+        saw_resolved_storage_reference = true;
+        resolution_complete = false;
+    }
+
     bool tryBeginResolution(const void * owner) noexcept
     {
         std::lock_guard lock(mutex);
@@ -279,7 +306,7 @@ public:
     [[nodiscard]] std::optional<QueryResultCacheStorageDependencyProof> snapshotIfComplete() const
     {
         std::lock_guard lock(mutex);
-        if (!proof_complete || !resolution_complete || (boundary_saw_storage_reference && dependencies.empty()))
+        if (!proof_complete || !resolution_complete || (boundary_saw_storage_reference && !saw_resolved_storage_reference))
             return std::nullopt;
 
         QueryResultCacheStorageDependencyProof result;
@@ -302,6 +329,7 @@ private:
     const void * resolution_owner = nullptr;
     bool resolution_complete = false;
     bool proof_complete = true;
+    bool saw_resolved_storage_reference = false;
 };
 
 }

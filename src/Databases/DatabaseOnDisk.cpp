@@ -29,6 +29,8 @@
 #include <Storages/AlterCommands.h>
 #include <Storages/IStorage.h>
 #include <Storages/StorageFactory.h>
+#include <Storages/StorageMaterializedView.h>
+#include <Storages/StorageTimeSeries.h>
 #include <TableFunctions/TableFunctionFactory.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/ErrnoException.h>
@@ -536,9 +538,16 @@ void DatabaseOnDisk::renameTable(
         }
     }
 
+    const auto * time_series = table->as<StorageTimeSeries>();
+    if ((from_ordinary_to_atomic || from_atomic_to_ordinary) && time_series && time_series->hasInnerTables())
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot move TimeSeries table with inner tables to other database");
+    }
+
     UUID ordinary_to_atomic_uuid = UUIDHelpers::Nil;
     UUID atomic_source_uuid = UUIDHelpers::Nil;
     DatabaseAtomic * source_atomic_database = nullptr;
+    DatabaseAtomic * target_atomic_database = nullptr;
     std::optional<DatabaseAtomic::CrossDatabaseMoveGuard> source_udt_guard;
     std::optional<DatabaseAtomic::CrossDatabaseMoveGuard> target_udt_guard;
     if (from_atomic_to_ordinary)
@@ -551,8 +560,8 @@ void DatabaseOnDisk::renameTable(
     if (from_ordinary_to_atomic)
     {
         ordinary_to_atomic_uuid = UUIDHelpers::generateV4();
-        auto & target_atomic = dynamic_cast<DatabaseAtomic &>(to_database);
-        target_udt_guard.emplace(target_atomic.acquireUDTCrossDatabaseTargetGuard(
+        target_atomic_database = &dynamic_cast<DatabaseAtomic &>(to_database);
+        target_udt_guard.emplace(target_atomic_database->acquireUDTCrossDatabaseTargetGuard(
             ordinary_to_atomic_uuid, table->getStorageID().getNameForLogs()));
     }
 
@@ -563,6 +572,42 @@ void DatabaseOnDisk::renameTable(
 
     UUID prev_uuid = UUIDHelpers::Nil;
     auto db_disk = getDisk();
+    bool udt_guard_released_for_nested_table = false;
+    bool udt_guard_revalidation_failed = false;
+    const auto before_nested_table_rename = [&]
+    {
+        if (udt_guard_released_for_nested_table)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Nested-table rename released its Atomic move guard twice");
+        if (source_udt_guard)
+            source_atomic_database->releaseUDTCrossDatabaseGuardForNestedTableRename(*source_udt_guard);
+        else if (target_udt_guard)
+            target_atomic_database->releaseUDTCrossDatabaseGuardForNestedTableRename(*target_udt_guard);
+        else
+            return;
+        udt_guard_released_for_nested_table = true;
+    };
+    const auto after_nested_table_rename = [&]
+    {
+        if (!udt_guard_released_for_nested_table)
+            return;
+        if (source_udt_guard)
+            source_atomic_database->reacquireUDTCrossDatabaseGuardAfterNestedTableRename(*source_udt_guard);
+        else
+            target_atomic_database->reacquireUDTCrossDatabaseGuardAfterNestedTableRename(*target_udt_guard);
+        udt_guard_released_for_nested_table = false;
+        try
+        {
+            if (source_udt_guard)
+                source_atomic_database->validateUDTCrossDatabaseGuardAfterNestedTableRename(*source_udt_guard, local_context);
+            else
+                target_atomic_database->validateUDTCrossDatabaseGuardAfterNestedTableRename(*target_udt_guard, local_context);
+        }
+        catch (...)
+        {
+            udt_guard_revalidation_failed = true;
+            throw;
+        }
+    };
     try
     {
         table_metadata_path = getObjectMetadataPath(table_name);
@@ -590,11 +635,26 @@ void DatabaseOnDisk::renameTable(
                 LOG_INFO(log, "Moving table from {} to {}", table_data_relative_path, to_database.getTableDataPath(create));
         }
 
-        /// Notify the table that it is renamed. It will move data to new path (if it stores data on disk) and update StorageID
-        table->rename(to_database.getTableDataPath(create), StorageID(create));
+        /// MaterializedView is always eagerly loaded by
+        /// DatabaseOrdinary::shouldLazyLoad because it owns an inner table.
+        /// Release the outer Atomic schema guard only around its recursive
+        /// inner-table DDL and reacquire it before publishing the outer
+        /// StorageID. Every other storage retains the original uninterrupted
+        /// cross-database guard.
+        const StorageID new_table_id(create);
+        if (auto * materialized_view = table->as<StorageMaterializedView>())
+        {
+            materialized_view->renameInMemoryWithNestedTableCallbacks(
+                new_table_id, before_nested_table_rename, after_nested_table_rename);
+        }
+        else
+            table->rename(to_database.getTableDataPath(create), new_table_id);
     }
     catch (const Exception &)
     {
+        after_nested_table_rename();
+        if (udt_guard_revalidation_failed)
+            throw;
         if (source_udt_guard)
         {
             source_atomic_database->setDetachedTableNotInUseForce(atomic_source_uuid);
@@ -610,6 +670,9 @@ void DatabaseOnDisk::renameTable(
     }
     catch (const Poco::Exception & e)
     {
+        after_nested_table_rename();
+        if (udt_guard_revalidation_failed)
+            throw;
         if (source_udt_guard)
         {
             source_atomic_database->setDetachedTableNotInUseForce(atomic_source_uuid);

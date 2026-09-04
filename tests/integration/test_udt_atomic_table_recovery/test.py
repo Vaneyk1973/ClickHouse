@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import sys
 import threading
 import uuid
 
@@ -797,25 +798,26 @@ def assert_startup_rejects_unexpected_artifact(database, directory):
 
 
 def cleanup_databases(*databases):
+    primary_exception_active = sys.exc_info()[0] is not None
     errors = []
-    if node.get_process_pid("clickhouse") is None:
-        try:
-            node.start_clickhouse()
-        except Exception as ex:  # noqa: BLE001 - report every cleanup failure.
-            errors.append(ex)
-
-    if node.get_process_pid("clickhouse") is not None:
+    try:
+        # This also waits for readiness when a server PID already exists.
+        node.start_clickhouse()
+    except Exception as ex:  # noqa: BLE001 - report every cleanup failure.
+        errors.append(ex)
+    else:
         for database in databases:
             try:
                 query(f"DROP DATABASE IF EXISTS {database} SYNC")
             except Exception as ex:  # noqa: BLE001 - continue cleaning peers.
                 errors.append(ex)
 
-    if errors:
+    if errors and not primary_exception_active:
         details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
         raise RuntimeError(f"UDT recovery test cleanup failed: {details}") from errors[0]
 
 
+@pytest.mark.timeout(1200)
 def test_mapped_table_artifacts_repair_or_fail_closed_exactly(started_cluster):
     database = unique_database("artifacts")
     try:

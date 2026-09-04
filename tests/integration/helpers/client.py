@@ -239,6 +239,12 @@ class CommandRequest:
     def wait_and_read_output(self):
         try:
             self.process.wait(timeout=DEFAULT_QUERY_TIMEOUT)
+            if self.timer is not None:
+                # The process is already reaped, so its timeout callback has
+                # no remaining work. Wake and join the non-daemon Timer to
+                # avoid delaying pytest shutdown until the original timeout.
+                self.timer.cancel()
+                self.timer.join()
             self.stdout_file.seek(0)
             self.stderr_file.seek(0)
 

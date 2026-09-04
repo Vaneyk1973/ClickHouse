@@ -12,6 +12,7 @@
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTParallelWithQuery.h>
+#include <Parsers/ASTQueryWithOutput.h>
 #include <Parsers/ASTSelectIntersectExceptQuery.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
@@ -433,6 +434,16 @@ bool mayContainExecutionASTsOutsideChildren(const IAST & root)
         || root_type == typeid(ASTBackupQuery) || mayContainTTLElements(root) || mayContainNestedStatements(root);
 }
 
+const IAST * getExecutionRootOutputSettings(const IAST & root) noexcept
+{
+    /// SETTINGS in the output suffix of the statement being executed affect
+    /// only that execution. The same ASTSetQuery shape nested in a stored
+    /// SELECT (for example a view definition) is durable and must keep the
+    /// ordinary fail-closed validation below.
+    const auto * query_with_output = dynamic_cast<const ASTQueryWithOutput *>(&root);
+    return query_with_output ? query_with_output->settings_ast.get() : nullptr;
+}
+
 bool isNestedStatementChild(const IAST & root, const IAST & child)
 {
     if (typeid(root) == typeid(ASTParallelWithQuery))
@@ -616,6 +627,7 @@ void validateUDTCastsBeforeSideEffectsImpl(
     StringCastTargetMemo & memo)
 {
     checkStackSize();
+    const IAST * execution_root_output_settings = getExecutionRootOutputSettings(root);
     validateUDTCastNode<inspect_constant_string_targets>(root, typeid(root), memo);
     validateRootExecutionASTsOutsideChildren<inspect_constant_string_targets>(root, memo);
 
@@ -633,6 +645,13 @@ void validateUDTCastsBeforeSideEffectsImpl(
                 validateUDTCastsBeforeSideEffects(*child, nested_options, memo);
                 continue;
             }
+        }
+
+        if (child.get() == execution_root_output_settings)
+        {
+            if (options.inspect_query_result_cache_candidates)
+                inspectRegularASTForBoundaryCandidates(*child, memo);
+            continue;
         }
 
         if (analyzer_owned_child && std::addressof(root) == analyzer_owned_child->owner && child.get() == analyzer_owned_child->child)
@@ -770,6 +789,7 @@ void inspectUDTExecutionRootAndSize(
     StringCastTargetMemo & memo)
 {
     checkStackSize();
+    const IAST * execution_root_output_settings = getExecutionRootOutputSettings(root);
     budget.consume();
     validateUDTCastNode<inspect_constant_string_targets>(root, typeid(root), memo);
 
@@ -787,6 +807,12 @@ void inspectUDTExecutionRootAndSize(
                 inspectUDTExecutionStatementAndSize(*child, budget, options, false, memo);
                 continue;
             }
+        }
+
+        if (child.get() == execution_root_output_settings)
+        {
+            checkRegularASTSize(*child, budget, &memo);
+            continue;
         }
 
         if (analyzer_owned_child && std::addressof(root) == analyzer_owned_child->owner && child.get() == analyzer_owned_child->child)

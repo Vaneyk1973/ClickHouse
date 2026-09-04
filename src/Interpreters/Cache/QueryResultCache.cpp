@@ -369,10 +369,6 @@ static bool astContainsSystemTables(ASTPtr ast, ContextPtr context)
 
 bool checkCanWriteQueryResultCache(ASTPtr ast, ContextPtr context, bool skip_context_check)
 {
-    if (context->isQueryResultCacheBlockedByUDT())
-        return false;
-    if (const auto collector = context->getUDTQueryResultCacheStorageDependencyCollector(); collector && !collector->snapshotIfComplete())
-        return false;
     const Settings & settings = context->getSettingsRef();
 
     if ((skip_context_check || context->getCanUseQueryResultCache()) && settings[Setting::enable_writes_to_query_cache])
@@ -396,7 +392,14 @@ bool checkCanWriteQueryResultCache(ASTPtr ast, ContextPtr context, bool skip_con
 
         if ((!ast_contains_nondeterministic_functions || nondeterministic_function_handling == QueryResultCacheNondeterministicFunctionHandling::Save)
             && (!ast_contains_system_tables || system_table_handling == QueryResultCacheSystemTableHandling::Save))
+        {
+            if (context->isQueryResultCacheBlockedByUDT())
+                return false;
+            if (const auto collector = context->getUDTQueryResultCacheStorageDependencyCollector();
+                collector && !collector->snapshotIfComplete())
+                return false;
             return true;
+        }
     }
 
     return false;

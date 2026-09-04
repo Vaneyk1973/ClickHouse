@@ -344,21 +344,14 @@ void UserDefinedSQLFunctionVisitor::visit(ASTPtr & ast, ContextPtr context_, boo
         ast,
         context_,
         reject_stored_udt_syntax_in_function_bodies,
-        reject_stored_udt_syntax_in_function_bodies ? &remaining_inspection_nodes : nullptr,
-        0);
+        reject_stored_udt_syntax_in_function_bodies ? &remaining_inspection_nodes : nullptr);
 }
 
 void UserDefinedSQLFunctionVisitor::visitImpl(
-    ASTPtr & ast, ContextPtr context_, bool reject_stored_udt_syntax_in_function_bodies, size_t * remaining_inspection_nodes, size_t depth)
+    ASTPtr & ast, ContextPtr context_, bool reject_stored_udt_syntax_in_function_bodies, size_t * remaining_inspection_nodes)
 {
     chassert(ast);
-    if (reject_stored_udt_syntax_in_function_bodies && depth > maximum_stored_udt_udf_scan_depth)
-    {
-        throw Exception(
-            ErrorCodes::TOO_DEEP_RECURSION,
-            "Stored-object SQL UDF substitution exceeds the maximum inspection depth ({})",
-            maximum_stored_udt_udf_scan_depth);
-    }
+    checkStackSize();
 
     for (auto & child : ast->children)
     {
@@ -372,7 +365,7 @@ void UserDefinedSQLFunctionVisitor::visitImpl(
         }
 
         auto * old_ptr = child.get();
-        visitImpl(child, context_, reject_stored_udt_syntax_in_function_bodies, remaining_inspection_nodes, depth + 1);
+        visitImpl(child, context_, reject_stored_udt_syntax_in_function_bodies, remaining_inspection_nodes);
         auto * new_ptr = child.get();
 
         /// Some AST classes have naked pointers to children elements as members.

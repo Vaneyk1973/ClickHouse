@@ -59,6 +59,8 @@
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionVisitor.h>
 
+#include <base/scope_guard.h>
+
 #if CLICKHOUSE_CLOUD
 #include <Interpreters/SharedDatabaseCatalog.h>
 #endif
@@ -817,6 +819,14 @@ InterpreterAlterQuery::InterpreterAlterQuery(
 
 BlockIO InterpreterAlterQuery::execute()
 {
+    auto udf_scope_context = getContext();
+    const bool previous_reject_stored_udt_syntax = udf_scope_context->shouldRejectStoredUDTSyntaxInSQLUDFBodies();
+    const bool previous_udf_substitution_frozen = udf_scope_context->isStoredObjectSQLUDFSubstitutionFrozen();
+    SCOPE_EXIT({
+        udf_scope_context->setRejectStoredUDTSyntaxInSQLUDFBodies(previous_reject_stored_udt_syntax);
+        udf_scope_context->setStoredObjectSQLUDFSubstitutionFrozen(previous_udf_substitution_frozen);
+    });
+
     if (udt_stored_object_ddl_select_boundary_handoff)
     {
         auto * alter = query_ptr ? query_ptr->as<ASTAlterQuery>() : nullptr;

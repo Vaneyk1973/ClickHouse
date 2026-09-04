@@ -67,6 +67,8 @@ struct DictionaryAuthorityReadLifetime
     ExternalDictionariesLoader::DictPtr dictionary;
 };
 
+constexpr size_t max_dictionary_read_admission_attempts = 3;
+
 ExternalDictionariesLoader::DictPtr retainDictionaryAuthorityReadEvidence(
     ExternalDictionariesLoader::DictPtr dictionary, UDT::AuthorityStorageReadContinuationEvidence::Ptr evidence)
 {
@@ -76,6 +78,11 @@ ExternalDictionariesLoader::DictPtr retainDictionaryAuthorityReadEvidence(
     auto lifetime = std::make_shared<DictionaryAuthorityReadLifetime>(
         DictionaryAuthorityReadLifetime{.evidence = std::move(evidence), .dictionary = std::move(dictionary)});
     return ExternalDictionariesLoader::DictPtr(lifetime, lifetime->dictionary.get());
+}
+
+bool hasSameDictionaryImage(const ExternalLoader::LoadResult & lhs, const ExternalLoader::LoadResult & rhs)
+{
+    return lhs.object.get() == rhs.object.get() && lhs.config == rhs.config;
 }
 
 bool tryParseNonNilUUID(std::string_view text, UUID & uuid)
@@ -237,6 +244,43 @@ UDT::AuthorityStorageReadContinuationEvidence::Ptr acquireMappedDDLDictionaryRea
     return UDT::acquireAuthorityStorageReadContinuationEvidence(*mapped->storage, mapped->metadata);
 }
 
+std::optional<ExternalDictionariesLoader::DictPtr> tryAcquireStableDictionaryRead(
+    const ExternalDictionariesLoader & loader,
+    const String & loader_name,
+    const ExternalLoader::LoadResult & loaded_result,
+    ContextPtr context)
+{
+    auto dictionary = std::static_pointer_cast<const IDictionary>(loaded_result.object);
+    if (!dictionary)
+        return ExternalDictionariesLoader::DictPtr{};
+
+    try
+    {
+        auto authority_read_evidence = loaded_result.config
+            ? acquireMappedDDLDictionaryReadAdmission(loader, loader_name, *loaded_result.config, context)
+            : UDT::AuthorityStorageReadContinuationEvidence::Ptr{};
+
+        /// Configuration repositories may republish an equivalent ObjectConfig
+        /// without reloading the dictionary object. The admission must still be
+        /// paired with one exact published object/config image, so let the caller
+        /// retry the whole acquisition when either pointer changed.
+        if (!hasSameDictionaryImage(loaded_result, loader.getLoadResult(loader_name)))
+            return std::nullopt;
+
+        return retainDictionaryAuthorityReadEvidence(std::move(dictionary), std::move(authority_read_evidence));
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::ABORTED || hasSameDictionaryImage(loaded_result, loader.getLoadResult(loader_name)))
+            throw;
+
+        /// An ABORTED result for a superseded image is a publication race. Do
+        /// not hide an ABORTED result for the still-current image: that signals
+        /// a real quarantine, identity, or authority-boundary violation.
+        return std::nullopt;
+    }
+}
+
 void assertMappedDDLDictionaryActivationAllowed(
     const ExternalDictionariesLoader & loader,
     const String & loader_name,
@@ -375,78 +419,83 @@ ExternalDictionariesLoader::getDictionary(const std::string & dictionary_name, C
     if (local_context->hasQueryContext())
         process_list_element = local_context->getProcessListElement();
 
-    LoadResult loaded_result;
-    if (process_list_element)
+    for (size_t attempt = 0; attempt < max_dictionary_read_admission_attempts; ++attempt)
     {
-        /// Wait with periodic cancellation checks
-        while (true)
+        LoadResult loaded_result;
+        if (process_list_element)
         {
-            auto result = tryLoad<LoadResult>(resolved_dictionary_name, /* timeout = */ std::chrono::milliseconds(1000));
-            if (result.object)
+            /// Wait with periodic cancellation checks
+            while (true)
             {
-                loaded_result = std::move(result);
-                break;
+                auto result = tryLoad<LoadResult>(resolved_dictionary_name, /* timeout = */ std::chrono::milliseconds(1000));
+                if (result.object)
+                {
+                    loaded_result = std::move(result);
+                    break;
+                }
+                /// If loading has terminally failed, call load() to throw the proper error
+                if (result.status != Status::LOADING && result.status != Status::NOT_LOADED)
+                {
+                    loaded_result = load<LoadResult>(resolved_dictionary_name);
+                    break;
+                }
+                /// Check if the query was cancelled while we were waiting
+                process_list_element->checkTimeLimit();
             }
-            /// If loading has terminally failed, call load() to throw the proper error
-            if (result.status != Status::LOADING && result.status != Status::NOT_LOADED)
-            {
-                loaded_result = load<LoadResult>(resolved_dictionary_name);
-                break;
-            }
-            /// Check if the query was cancelled while we were waiting
-            process_list_element->checkTimeLimit();
         }
-    }
-    else
-    {
-        loaded_result = load<LoadResult>(resolved_dictionary_name);
-    }
+        else
+        {
+            loaded_result = load<LoadResult>(resolved_dictionary_name);
+        }
 
-    auto dictionary = std::static_pointer_cast<const IDictionary>(loaded_result.object);
-    auto authority_read_evidence = loaded_result.config
-        ? acquireMappedDDLDictionaryReadAdmission(*this, resolved_dictionary_name, *loaded_result.config, local_context)
-        : UDT::AuthorityStorageReadContinuationEvidence::Ptr{};
+        auto stable_dictionary = tryAcquireStableDictionaryRead(*this, resolved_dictionary_name, loaded_result, local_context);
+        if (stable_dictionary)
+        {
+            auto dictionary = std::move(*stable_dictionary);
+            if (local_context->hasQueryContext() && local_context->getSettingsRef()[Setting::log_queries])
+                local_context->getQueryContext()->addQueryFactoriesInfo(
+                    Context::QueryLogFactories::Dictionary, dictionary->getQualifiedName());
 
-    /// The admission above deliberately happens after loading. Recheck that
-    /// the loader still publishes this exact object/config pair so a
-    /// concurrent reload cannot pair evidence for the old image with the new
-    /// dictionary (or vice versa).
-    const auto verified_result = getLoadResult(resolved_dictionary_name);
-    if (verified_result.object.get() != loaded_result.object.get() || verified_result.config != loaded_result.config)
-    {
-        throw Exception(
-            ErrorCodes::ABORTED, "Dictionary '{}' changed while acquiring its mapped UDT read admission", resolved_dictionary_name);
+            return dictionary;
+        }
+
+        if (process_list_element)
+            process_list_element->checkTimeLimit();
     }
 
-    if (local_context->hasQueryContext() && local_context->getSettingsRef()[Setting::log_queries])
-        local_context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Dictionary, dictionary->getQualifiedName());
-
-    return retainDictionaryAuthorityReadEvidence(std::move(dictionary), std::move(authority_read_evidence));
+    throw Exception(
+        ErrorCodes::ABORTED,
+        "Dictionary '{}' kept changing while acquiring its mapped UDT read admission after {} attempts",
+        resolved_dictionary_name,
+        max_dictionary_read_admission_attempts);
 }
 
 ExternalDictionariesLoader::DictPtr
 ExternalDictionariesLoader::tryGetDictionary(const std::string & dictionary_name, ContextPtr local_context) const
 {
     std::string resolved_dictionary_name = resolveDictionaryName(dictionary_name, local_context->getCurrentDatabase());
-    auto loaded_result = tryLoad<LoadResult>(resolved_dictionary_name);
-    auto dictionary = std::static_pointer_cast<const IDictionary>(loaded_result.object);
-    if (!dictionary)
-        return {};
-
-    auto authority_read_evidence = loaded_result.config
-        ? acquireMappedDDLDictionaryReadAdmission(*this, resolved_dictionary_name, *loaded_result.config, local_context)
-        : UDT::AuthorityStorageReadContinuationEvidence::Ptr{};
-    const auto verified_result = getLoadResult(resolved_dictionary_name);
-    if (verified_result.object.get() != loaded_result.object.get() || verified_result.config != loaded_result.config)
+    for (size_t attempt = 0; attempt < max_dictionary_read_admission_attempts; ++attempt)
     {
-        throw Exception(
-            ErrorCodes::ABORTED, "Dictionary '{}' changed while acquiring its mapped UDT read admission", resolved_dictionary_name);
+        auto loaded_result = tryLoad<LoadResult>(resolved_dictionary_name);
+        auto stable_dictionary = tryAcquireStableDictionaryRead(*this, resolved_dictionary_name, loaded_result, local_context);
+        if (!stable_dictionary)
+            continue;
+
+        auto dictionary = std::move(*stable_dictionary);
+        if (!dictionary)
+            return {};
+
+        if (local_context->hasQueryContext() && local_context->getSettingsRef()[Setting::log_queries])
+            local_context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Dictionary, dictionary->getQualifiedName());
+
+        return dictionary;
     }
 
-    if (local_context->hasQueryContext() && local_context->getSettingsRef()[Setting::log_queries])
-        local_context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Dictionary, dictionary->getQualifiedName());
-
-    return retainDictionaryAuthorityReadEvidence(std::move(dictionary), std::move(authority_read_evidence));
+    throw Exception(
+        ErrorCodes::ABORTED,
+        "Dictionary '{}' kept changing while acquiring its mapped UDT read admission after {} attempts",
+        resolved_dictionary_name,
+        max_dictionary_read_admission_attempts);
 }
 
 

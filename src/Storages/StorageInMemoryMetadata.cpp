@@ -282,6 +282,8 @@ ContextMutablePtr StorageInMemoryMetadata::getSQLSecurityOverriddenContext(Conte
     /// closure. Preserve the exact dependency collector without carrying the
     /// invoker identity into the overridden context.
     new_context->setUDTQueryResultCacheStorageDependencyCollector(context->getUDTQueryResultCacheStorageDependencyCollector());
+    new_context->setUDTTableFunctionStorageObserver(context->getUDTTableFunctionStorageObserver());
+    new_context->setUDTAliasResolutionObserver(context->getUDTAliasResolutionObserver());
     if (client_info)
         new_context->setClientInfo(*client_info);
     else

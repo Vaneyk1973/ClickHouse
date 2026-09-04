@@ -11,6 +11,9 @@ SET enable_group_by_top_k_optimization = 1;
 -- CI randomizes query_plan_max_limit_for_top_k_optimization (can be tiny); pin it.
 SET query_plan_max_limit_for_top_k_optimization = 1000;
 SET max_threads = 1;
+-- Aggregation in order is orthogonal to the top-K optimization and can make
+-- the composite-key control queries pathologically slow in Debug builds.
+SET optimize_aggregation_in_order = 0;
 -- CI profile sets max_rows_to_group_by, which disables the optimization; reset it.
 SET max_rows_to_group_by = 0;
 SET optimize_trivial_group_by_limit_query = 0;

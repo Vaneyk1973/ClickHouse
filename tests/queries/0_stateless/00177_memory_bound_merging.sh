@@ -63,7 +63,9 @@ test2() {
 test3() {
     $CLICKHOUSE_CLIENT -q "
         SET cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost';
-        SET max_threads = 16, read_in_order_two_level_merge_threshold = 1000, distributed_aggregation_memory_efficient = 1;
+        SET max_threads = 16, read_in_order_two_level_merge_threshold = 1000, distributed_aggregation_memory_efficient = 1,
+            merge_tree_min_rows_for_concurrent_read = 1, merge_tree_min_bytes_for_concurrent_read = 1,
+            merge_tree_min_read_task_size = 1;
 
         SELECT replaceRegexpOne(explain, '^ *(\w+).*', '\\1')
         FROM (

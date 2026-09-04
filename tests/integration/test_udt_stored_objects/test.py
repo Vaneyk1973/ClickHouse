@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 
 import pytest
@@ -87,6 +88,31 @@ def run_cleanup_steps(*steps):
 
 def assert_absent(database, object_name):
     assert q(f"EXISTS TABLE {database}.{object_name}").strip() == "0"
+
+
+def wait_for_clean_verification(database, timeout=60):
+    deadline = time.monotonic() + timeout
+    last_status = None
+    while time.monotonic() < deadline:
+        statuses = rows_json(
+            "SELECT udt_verification_state, udt_verification_cursor_advances, "
+            "udt_verification_last_root_authority_anchor, "
+            "udt_verification_last_successful_root_authority_anchor "
+            f"FROM system.databases WHERE name = {sql_string(database)}"
+        )
+        assert len(statuses) == 1
+        last_status = statuses[0]
+        if (
+            last_status["udt_verification_state"] == "Scheduled"
+            and last_status["udt_verification_cursor_advances"] > 0
+            and last_status["udt_verification_last_root_authority_anchor"]
+            == last_status["udt_verification_last_successful_root_authority_anchor"]
+        ):
+            return
+        time.sleep(0.1)
+    raise AssertionError(
+        f"UDT authority verification did not reach a clean scheduled state: {last_status}"
+    )
 
 
 def assert_stored_object_rejected(sql):
@@ -675,6 +701,12 @@ def test_dictionary_config_reload_detach_attach_and_drop_release_dependency(
             assert not request_error, (request_name, request_error)
 
         assert_absent(database, "mapped_dictionary")
+        detached_show_error = query_error(
+            f"SHOW CREATE DICTIONARY {database}.mapped_dictionary"
+        )
+        assert "NOT_IMPLEMENTED" in detached_show_error, detached_show_error
+        assert "detached mapped object" in detached_show_error, detached_show_error
+        assert "exact live user-defined type binding" in detached_show_error, detached_show_error
         q("SYSTEM RELOAD CONFIG")
         assert_absent(database, "mapped_dictionary")
         restricted = query_error(f"DROP TYPE {database}.UserId RESTRICT")
@@ -1091,6 +1123,11 @@ def test_publication_failures_leave_no_partial_view(started_cluster, failpoint):
             f"(id {database}.UserId) ENGINE = MergeTree ORDER BY id"
         )
         q(f"INSERT INTO {database}.source VALUES (7)")
+        if failpoint == "udt_schema_storage_temp_write_failure":
+            # This low-level ONCE failpoint is shared with the periodic verifier's
+            # cursor persistence.  Wait until that verifier has completed a clean
+            # batch so the foreground publication is the next storage writer.
+            wait_for_clean_verification(database)
         q(f"SYSTEM ENABLE FAILPOINT {failpoint}")
         enabled = True
         result = query_error(

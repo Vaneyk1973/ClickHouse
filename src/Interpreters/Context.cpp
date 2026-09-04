@@ -1427,6 +1427,8 @@ ContextData::ContextData(const ContextData &o) :
     can_use_query_result_cache(o.can_use_query_result_cache.load(std::memory_order_acquire)),
     query_result_cache_blocked_by_udt(o.query_result_cache_blocked_by_udt.load(std::memory_order_acquire)),
     udt_selected_output_binding_collector(o.udt_selected_output_binding_collector),
+    udt_table_function_storage_observer(o.udt_table_function_storage_observer),
+    udt_alias_resolution_observer(o.udt_alias_resolution_observer),
     udt_stored_expression_type_references(o.udt_stored_expression_type_references),
     reject_stored_udt_syntax_in_sql_udf_bodies(o.reject_stored_udt_syntax_in_sql_udf_bodies),
     stored_object_sql_udf_substitution_frozen(o.stored_object_sql_udf_substitution_frozen),
@@ -3187,10 +3189,15 @@ StoragePtr Context::executeTableFunction(const ASTPtr & table_expression, const 
                                                      /* comment */ "",
                                                      /* is_parameterized_view */ true);
             res->startup();
+            observeUDTTableFunctionStorage(table_expression, res);
             function->setPreferSubqueryToFunctionFormatting(true);
             return res;
         }
     }
+    ASTPtr original_observed_invocation;
+    if (udt_table_function_storage_observer)
+        original_observed_invocation = table_expression->clone();
+
     auto hash = table_expression->getTreeHash(/*ignore_aliases=*/ true);
     auto key = toString(hash);
 
@@ -3387,6 +3394,9 @@ StoragePtr Context::executeTableFunction(const ASTPtr & table_expression, const 
             table_function_results[key] = res;
         }
     }
+    observeUDTTableFunctionStorage(table_expression, res);
+    if (original_observed_invocation)
+        observeUDTTableFunctionStorage(original_observed_invocation, res);
     return res;
 }
 
@@ -3434,6 +3444,7 @@ StoragePtr Context::executeTableFunction(
         table_function_results[key] = res;
     }
 
+    observeUDTTableFunctionStorage(table_expression, res);
     return res;
 }
 
@@ -5587,6 +5598,26 @@ void Context::setUDTSelectedOutputTypeBindingCollector(std::shared_ptr<UDT::Sele
 std::shared_ptr<UDT::SelectedOutputTypeBindingCollector> Context::getUDTSelectedOutputTypeBindingCollector() const
 {
     return udt_selected_output_binding_collector;
+}
+
+void Context::setUDTTableFunctionStorageObserver(std::shared_ptr<UDT::TableFunctionStorageObserver> observer)
+{
+    udt_table_function_storage_observer = std::move(observer);
+}
+
+std::shared_ptr<UDT::TableFunctionStorageObserver> Context::getUDTTableFunctionStorageObserver() const
+{
+    return udt_table_function_storage_observer;
+}
+
+void Context::setUDTAliasResolutionObserver(std::shared_ptr<UDT::AliasResolutionObserver> observer)
+{
+    udt_alias_resolution_observer = std::move(observer);
+}
+
+std::shared_ptr<UDT::AliasResolutionObserver> Context::getUDTAliasResolutionObserver() const
+{
+    return udt_alias_resolution_observer;
 }
 
 void Context::setUDTStoredExpressionTypeReferences(std::shared_ptr<const UDT::BoundObjectTypeReferences> references)

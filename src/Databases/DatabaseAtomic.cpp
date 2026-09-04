@@ -1757,13 +1757,17 @@ DatabaseAtomic::CrossDatabaseMoveGuard::CrossDatabaseMoveGuard(
     StoragePtr source_table_,
     String source_table_name_,
     UUID source_table_uuid_,
-    String source_relative_table_path_) noexcept
+    String source_relative_table_path_,
+    String target_table_name_for_logs_,
+    UUID target_incoming_table_uuid_) noexcept
     : lock(std::move(lock_))
     , kind(kind_)
     , source_table(std::move(source_table_))
     , source_table_name(std::move(source_table_name_))
     , source_table_uuid(source_table_uuid_)
     , source_relative_table_path(std::move(source_relative_table_path_))
+    , target_table_name_for_logs(std::move(target_table_name_for_logs_))
+    , target_incoming_table_uuid(target_incoming_table_uuid_)
 {
 }
 
@@ -2206,7 +2210,15 @@ DatabaseAtomic::acquireUDTCrossDatabaseTargetGuard(UUID incoming_table_uuid, std
     std::unique_lock schema_mutation_lock(udt_schema_mutation_mutex);
     UDT::assertTableCanEnterAtomicDatabase(
         hasDatabaseOwnedTableExpectationForCrossDatabaseMove(incoming_table_uuid), table_name_for_logs, getDatabaseName());
-    return CrossDatabaseMoveGuard(std::move(schema_mutation_lock), CrossDatabaseMoveGuard::Kind::Target, {}, {}, UUIDHelpers::Nil, {});
+    return CrossDatabaseMoveGuard(
+        std::move(schema_mutation_lock),
+        CrossDatabaseMoveGuard::Kind::Target,
+        {},
+        {},
+        UUIDHelpers::Nil,
+        {},
+        String(table_name_for_logs),
+        incoming_table_uuid);
 }
 
 DatabaseAtomic::CrossDatabaseMoveGuard DatabaseAtomic::acquireUDTCrossDatabaseSourceGuard(
@@ -2230,7 +2242,14 @@ DatabaseAtomic::CrossDatabaseMoveGuard DatabaseAtomic::acquireUDTCrossDatabaseSo
     assertNotLiveMappedMaterializedViewInnerTable(table, "move across databases");
     UDT::assertTableCanLeaveAtomicDatabase(hasDatabaseOwnedUDTTableBinding(table, local_context), table->getStorageID().getNameForLogs());
     return CrossDatabaseMoveGuard(
-        std::move(schema_mutation_lock), CrossDatabaseMoveGuard::Kind::Source, table, name, table_id.uuid, relative_table_path);
+        std::move(schema_mutation_lock),
+        CrossDatabaseMoveGuard::Kind::Source,
+        table,
+        name,
+        table_id.uuid,
+        relative_table_path,
+        {},
+        UUIDHelpers::Nil);
 }
 
 void DatabaseAtomic::assertOwnsUDTCrossDatabaseGuard(const CrossDatabaseMoveGuard & guard, CrossDatabaseMoveGuard::Kind expected_kind) const
@@ -2242,6 +2261,57 @@ void DatabaseAtomic::assertOwnsUDTCrossDatabaseGuard(const CrossDatabaseMoveGuar
             "Atomic cross-database move guard has the wrong database, "
             "capability kind, or lock state");
     }
+}
+
+void DatabaseAtomic::releaseUDTCrossDatabaseGuardForNestedTableRename(CrossDatabaseMoveGuard & guard) const
+{
+    if (!guard.lock.owns_lock() || guard.lock.mutex() != &udt_schema_mutation_mutex)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Atomic nested-table rename guard has the wrong database or lock state");
+    guard.lock.unlock();
+}
+
+void DatabaseAtomic::reacquireUDTCrossDatabaseGuardAfterNestedTableRename(CrossDatabaseMoveGuard & guard) const
+{
+    if (guard.lock.owns_lock() || guard.lock.mutex() != &udt_schema_mutation_mutex)
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Atomic nested-table rename guard has the wrong database or lock state");
+    }
+    guard.lock.lock();
+}
+
+void DatabaseAtomic::validateUDTCrossDatabaseGuardAfterNestedTableRename(
+    const CrossDatabaseMoveGuard & guard, ContextPtr local_context) const
+{
+    assertOwnsUDTCrossDatabaseGuard(guard, guard.kind);
+    if (guard.kind == CrossDatabaseMoveGuard::Kind::Target)
+    {
+        if (guard.target_incoming_table_uuid == UUIDHelpers::Nil
+            || !DatabaseCatalog::instance().hasUUIDMapping(guard.target_incoming_table_uuid))
+        {
+            throw Exception(ErrorCodes::ABORTED, "Atomic target UUID reservation was lost during nested-table rename");
+        }
+        UDT::assertTableCanEnterAtomicDatabase(
+            hasDatabaseOwnedTableExpectationForCrossDatabaseMove(guard.target_incoming_table_uuid),
+            guard.target_table_name_for_logs,
+            getDatabaseName());
+        return;
+    }
+
+    const auto table_id = guard.source_table->getStorageID();
+    {
+        std::lock_guard tables_lock(mutex);
+        const auto detached_it = detached_tables.find(guard.source_table_uuid);
+        if (tables.contains(guard.source_table_name) || table_name_to_path.contains(guard.source_table_name)
+            || detached_it == detached_tables.end() || detached_it->second != guard.source_table
+            || table_id.database_name != database_name || table_id.table_name != guard.source_table_name
+            || table_id.uuid != guard.source_table_uuid)
+        {
+            throw Exception(ErrorCodes::ABORTED, "Atomic source table changed during nested-table cross-database rename");
+        }
+    }
+    assertNotLiveMappedMaterializedViewInnerTable(guard.source_table, "continue a move across databases");
+    UDT::assertTableCanLeaveAtomicDatabase(
+        hasDatabaseOwnedUDTTableBinding(guard.source_table, local_context), table_id.getNameForLogs());
 }
 
 void DatabaseAtomic::attachTableUnderUDTCrossDatabaseGuard(
@@ -3560,6 +3630,7 @@ void DatabaseAtomic::attachTable(
 {
     auto component_guard = Coordination::setCurrentComponent("DatabaseAtomic::attachTable");
     chassert(relative_table_path != data_path && !relative_table_path.empty());
+    cleanupDetachedTablesBeforeAttachWithoutSchemaGuard();
 
     bool pending_startup = false;
     {
@@ -3630,7 +3701,6 @@ void DatabaseAtomic::attachTable(
                 assertUDTTableAllowsOrdinaryMetadataMutation(table, getContext(), "ATTACH");
             attachTableWithoutUDTGuard(name, table, relative_table_path);
         }
-        cleanupDetachedTablesAfterAttachWithoutSchemaGuard();
         return;
     }
 
@@ -3726,7 +3796,6 @@ void DatabaseAtomic::attachTable(
             udt_table_startup_state->markAttached(*current_entry, table, current_database_name);
         }
     }
-    cleanupDetachedTablesAfterAttachWithoutSchemaGuard();
 }
 
 void DatabaseAtomic::attachTableWithoutUDTGuard(const String & name, const StoragePtr & table, const String & relative_table_path)
@@ -3739,7 +3808,7 @@ void DatabaseAtomic::attachTableWithoutUDTGuard(const String & name, const Stora
     table_name_to_path.emplace(std::make_pair(name, relative_table_path));
 }
 
-void DatabaseAtomic::cleanupDetachedTablesAfterAttachWithoutSchemaGuard()
+void DatabaseAtomic::cleanupDetachedTablesBeforeAttachWithoutSchemaGuard()
 {
     /// IStorage destruction may re-enter database-owned resources. Select
     /// stale entries under the tables mutex, but release both database locks
@@ -3752,7 +3821,7 @@ void DatabaseAtomic::cleanupDetachedTablesAfterAttachWithoutSchemaGuard()
     if (!not_in_use.empty())
     {
         not_in_use.clear();
-        LOG_DEBUG(log, "Finished removing not used detached tables after attach");
+        LOG_DEBUG(log, "Finished removing not used detached tables before attach");
     }
 }
 
@@ -4856,7 +4925,11 @@ void DatabaseAtomic::commitCreateTable(
     const String & table_metadata_path,
     ContextPtr query_context)
 {
-    const auto metadata = table->getInMemoryMetadataPtr(query_context, false);
+    /// CREATE commits the new outer object's own durable metadata. Wrappers
+    /// such as Alias may expose their target's live metadata through the
+    /// virtual lookup, but that target binding is neither owned nor persisted
+    /// by the wrapper and must not select the mapped-table commit protocol.
+    const auto metadata = table->IStorage::getInMemoryMetadataPtr(query_context, true);
     if (!metadata)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Atomic table CREATE has no metadata snapshot");
     metadata->validateBoundUDTReferences();

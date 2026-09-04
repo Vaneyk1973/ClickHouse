@@ -116,7 +116,9 @@ public:
             StoragePtr source_table_,
             String source_table_name_,
             UUID source_table_uuid_,
-            String source_relative_table_path_) noexcept;
+            String source_relative_table_path_,
+            String target_table_name_for_logs_,
+            UUID target_incoming_table_uuid_) noexcept;
 
         friend class DatabaseAtomic;
 
@@ -126,13 +128,17 @@ public:
         String source_table_name;
         UUID source_table_uuid;
         String source_relative_table_path;
+        String target_table_name_for_logs;
+        UUID target_incoming_table_uuid;
     };
 
     /// Serializes an ordinary DETACH boundary with mapped-table ALTER/admission.
     /// The interpreter acquires every affected table's ALTER lock first, then
-    /// retains this database-schema lock through shutdown, dependency removal,
-    /// and catalog detachment. This preserves the global table -> schema lock
-    /// order used by ALTER.
+    /// retains this database-schema lock through per-table shutdown and
+    /// dependency removal. After taking the exclusive database DDL guard, the
+    /// interpreter releases it before catalog detachment because
+    /// DatabaseAtomic::shutdown() enters the same schema mutex. This preserves
+    /// the global table -> schema lock order used by ALTER without self-deadlock.
     class UDTDetachGuard final
     {
     public:
@@ -410,7 +416,7 @@ protected:
     using DetachedTables = std::unordered_map<UUID, StoragePtr>;
     [[nodiscard]] DetachedTables cleanupDetachedTables() TSA_REQUIRES(mutex);
     void attachTableWithoutUDTGuard(const String & name, const StoragePtr & table, const String & relative_table_path);
-    void cleanupDetachedTablesAfterAttachWithoutSchemaGuard();
+    void cleanupDetachedTablesBeforeAttachWithoutSchemaGuard();
     [[nodiscard]] std::pair<StoragePtr, DetachedTables>
     detachTableWithoutUDTGuard(const String & name, const StoragePtr & expected_table, bool cleanup_detached_tables);
 
@@ -521,6 +527,10 @@ private:
         const UDT::AuthorityVerificationBatchReceipt * verified_prefix = nullptr);
     void assertOwnsUDTDetachGuard(const UDTDetachGuard & guard, const StoragePtr & expected_table) const;
     void assertOwnsUDTCrossDatabaseGuard(const CrossDatabaseMoveGuard & guard, CrossDatabaseMoveGuard::Kind expected_kind) const;
+    void releaseUDTCrossDatabaseGuardForNestedTableRename(CrossDatabaseMoveGuard & guard) const TSA_NO_THREAD_SAFETY_ANALYSIS;
+    void reacquireUDTCrossDatabaseGuardAfterNestedTableRename(CrossDatabaseMoveGuard & guard) const TSA_NO_THREAD_SAFETY_ANALYSIS;
+    void validateUDTCrossDatabaseGuardAfterNestedTableRename(
+        const CrossDatabaseMoveGuard & guard, ContextPtr local_context) const TSA_NO_THREAD_SAFETY_ANALYSIS;
     void attachTableUnderUDTCrossDatabaseGuard(
         const String & name, const StoragePtr & table, const String & relative_table_path, const CrossDatabaseMoveGuard & guard)
         TSA_NO_THREAD_SAFETY_ANALYSIS;

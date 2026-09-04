@@ -33,6 +33,11 @@ namespace DB
         return QueryProcessingStage::FetchColumns;
     }
 
+    StoragePtr StorageLoop::getInnerStorage() const
+    {
+        return inner_storage;
+    }
+
     void StorageLoop::read(
             QueryPlan & query_plan,
             const Names & column_names,

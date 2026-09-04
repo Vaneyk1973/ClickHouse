@@ -8,6 +8,7 @@
 #include <Common/typeid_cast.h>
 #include <Access/Common/AccessFlags.h>
 #include <Access/ContextAccess.h>
+#include <Databases/DatabaseAtomic.h>
 #include <Databases/UDT/ILifecycleAdapter.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -43,6 +44,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int ABORTED;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
     extern const int QUERY_WAS_CANCELLED;
     extern const int QUERY_WAS_CANCELLED_BY_CLIENT;
     extern const int TIMEOUT_EXCEEDED;
@@ -201,28 +203,47 @@ QueryPipeline InterpreterShowCreateQuery::executeImpl()
         {
             udt_introspection_database
                 = DatabaseCatalog::instance().getDatabase(table_id.database_name);
-            udt_introspection_table
-                = DatabaseCatalog::instance().getTable(table_id, getContext());
-            udt_introspection_table_lock = udt_introspection_table->lockForShare(
-                getContext()->getInitialQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
-            udt_introspection_lease = udt_introspection_database
-                                                       ->getUDTLifecycleAdapter()
-                                                       .acquireTableIntrospectionLease(
-                                                           udt_introspection_table,
-                                                           std::chrono::milliseconds(
-                                                               getContext()->getSettingsRef()[Setting::lock_acquire_timeout].totalMilliseconds()),
-                                                           [context = getContext()]
-                                                           {
-                                                               if (const auto process_list_element = context->getProcessListElementSafe())
-                                                                   static_cast<void>(process_list_element->checkTimeLimit());
-                                                           });
-            if (udt_introspection_database->tryGetTable(table_id.table_name, getContext())
-                != udt_introspection_table)
-            {
-                throw Exception(ErrorCodes::ABORTED, "Table changed while acquiring its user-defined type introspection lease");
-            }
-            create_query = udt_introspection_database->getCreateTableQuery(
+            udt_introspection_table = udt_introspection_database->tryGetTable(
                 table_id.table_name, getContext());
+            if (udt_introspection_table)
+            {
+                udt_introspection_table_lock = udt_introspection_table->lockForShare(
+                    getContext()->getInitialQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
+                /// Keep this unconditional for a live object: the lifecycle
+                /// adapter chooses a schema-only physical lease or the full
+                /// ALTER -> schema lease while closing a concurrent
+                /// physical-to-mapped transition between those paths.
+                udt_introspection_lease = udt_introspection_database->getUDTLifecycleAdapter().acquireTableIntrospectionLease(
+                    udt_introspection_table,
+                    std::chrono::milliseconds(getContext()->getSettingsRef()[Setting::lock_acquire_timeout].totalMilliseconds()),
+                    [context = getContext()]
+                    {
+                        if (const auto process_list_element = context->getProcessListElementSafe())
+                            static_cast<void>(process_list_element->checkTimeLimit());
+                    });
+                /// Unsupported lifecycle adapters return no lease. Such
+                /// databases cannot own durable UDT bindings and may expose a
+                /// fresh transient proxy on every lookup (DatabaseRemote is
+                /// one example), so pointer identity is meaningful only when
+                /// an adapter actually pinned the introspection lifecycle.
+                if (udt_introspection_lease
+                    && udt_introspection_database->tryGetTable(table_id.table_name, getContext()) != udt_introspection_table)
+                {
+                    throw Exception(ErrorCodes::ABORTED, "Table changed while acquiring its user-defined type introspection lease");
+                }
+                /// Refetch under the share lock and schema snapshot so the
+                /// live AST and outer metadata describe one object image.
+                create_query = udt_introspection_database->getCreateTableQuery(
+                    table_id.table_name, getContext());
+            }
+            else
+            {
+                /// DatabaseOnDisk deliberately serves persisted CREATE
+                /// metadata for detached objects. Keep this AST-only fallback
+                /// reachable when there is no live Storage to lock or lease.
+                create_query = udt_introspection_database->getCreateTableQuery(
+                    table_id.table_name, getContext());
+            }
         }
         if (!create_query)
             create_query = DatabaseCatalog::instance().getDatabase(table_id.database_name)->getCreateTableQuery(table_id.table_name, getContext());
@@ -261,10 +282,12 @@ QueryPipeline InterpreterShowCreateQuery::executeImpl()
             const auto acquire_dictionary_introspection = [&]
             {
                 udt_introspection_database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
-                udt_introspection_table = DatabaseCatalog::instance().getTable(table_id, getContext());
+                udt_introspection_table = udt_introspection_database->tryGetTable(table_id.table_name, getContext());
+                if (!udt_introspection_table)
+                    return;
                 udt_introspection_table_lock = udt_introspection_table->lockForShare(
                     getContext()->getInitialQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
-                auto metadata_snapshot = udt_introspection_table->getInMemoryMetadataPtr(getContext(), false);
+                auto metadata_snapshot = udt_introspection_table->IStorage::getInMemoryMetadataPtr(getContext(), true);
                 if (metadata_snapshot->getBoundUDTReferences())
                 {
                     udt_introspection_lease = udt_introspection_database->getUDTLifecycleAdapter().acquireTableIntrospectionLease(
@@ -316,18 +339,32 @@ QueryPipeline InterpreterShowCreateQuery::executeImpl()
                 acquire_dictionary_introspection();
         }
 
+        if (!udt_introspection_table)
+        {
+            const auto detached_uuid = create_query->as<const ASTCreateQuery &>().uuid;
+            auto * atomic_database = udt_introspection_database
+                ? typeid_cast<DatabaseAtomic *>(udt_introspection_database.get())
+                : nullptr;
+            if (atomic_database && detached_uuid != UUIDHelpers::Nil
+                && atomic_database->hasDatabaseOwnedUDTObject(detached_uuid))
+            {
+                /// Persisted mapped CREATE metadata is physicalized. Without
+                /// the detached storage's exact bound sidecar, returning that
+                /// AST would silently erase logical identity from introspection.
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot show CREATE for detached mapped object {} without its exact live user-defined type binding",
+                    table_id.getNameForLogs());
+            }
+        }
+
         auto & ast_create_query = create_query->as<ASTCreateQuery &>();
 
-        if (query_ptr->as<ASTShowCreateTableQuery>() && !ast_create_query.isView() && !ast_create_query.is_dictionary)
+        if (udt_introspection_table && query_ptr->as<ASTShowCreateTableQuery>()
+            && !ast_create_query.isView() && !ast_create_query.is_dictionary)
         {
-            auto table = udt_introspection_table
-                ? udt_introspection_table
-                : DatabaseCatalog::instance().getTable(table_id, getContext());
-            auto table_lock = udt_introspection_table_lock
-                ? udt_introspection_table_lock
-                : table->lockForShare(
-                    getContext()->getInitialQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
-            auto metadata_snapshot = table->getInMemoryMetadataPtr(getContext(), false);
+            auto table = udt_introspection_table;
+            auto metadata_snapshot = table->IStorage::getInMemoryMetadataPtr(getContext(), true);
             if (metadata_snapshot->getBoundUDTReferences())
             {
                 if (!udt_introspection_database || !udt_introspection_lease)
@@ -338,13 +375,10 @@ QueryPipeline InterpreterShowCreateQuery::executeImpl()
                     ast_create_query, table->getStorageID(), declared_columns);
             }
         }
-        else if (ast_create_query.isView() || ast_create_query.is_dictionary)
+        else if (udt_introspection_table && (ast_create_query.isView() || ast_create_query.is_dictionary))
         {
-            auto table = udt_introspection_table ? udt_introspection_table : DatabaseCatalog::instance().getTable(table_id, getContext());
-            auto table_lock = udt_introspection_table_lock
-                ? udt_introspection_table_lock
-                : table->lockForShare(getContext()->getInitialQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
-            auto metadata_snapshot = table->getInMemoryMetadataPtr(getContext(), false);
+            auto table = udt_introspection_table;
+            auto metadata_snapshot = table->IStorage::getInMemoryMetadataPtr(getContext(), true);
             if (metadata_snapshot->getBoundUDTReferences())
             {
                 if (!udt_introspection_database || !udt_introspection_lease)

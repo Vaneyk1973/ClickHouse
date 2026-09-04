@@ -186,6 +186,30 @@ TEST(UDTQueryCacheDependencies, ContextualCandidateMaskIsPartOfThePublishedProof
     EXPECT_EQ(proof->contextual_sink_candidates, mask);
 }
 
+TEST(UDTQueryCacheDependencies, ResolvedTransientTableFunctionCompletesAnEmptyPhysicalProof)
+{
+    int owner = 0;
+    QueryResultCacheStorageDependencyCollector collector(/*boundary_saw_storage_reference_=*/true);
+    ASSERT_TRUE(collector.tryBeginResolution(&owner));
+    collector.recordResolvedTransientTableFunction(StorageID{"", "numbers"}, "SystemNumbers", {});
+    collector.markResolutionComplete(&owner);
+    auto proof = collector.snapshotIfComplete();
+    ASSERT_TRUE(proof);
+    EXPECT_TRUE(proof->dependencies.empty());
+
+    QueryResultCacheStorageDependencyCollector mapped_transient(true);
+    ASSERT_TRUE(mapped_transient.tryBeginResolution(&owner));
+    mapped_transient.recordResolvedTransientTableFunction(StorageID{"", "eval"}, "View", boundReferences());
+    mapped_transient.markResolutionComplete(&owner);
+    EXPECT_FALSE(mapped_transient.snapshotIfComplete().has_value());
+
+    QueryResultCacheStorageDependencyCollector persistent_storage(true);
+    ASSERT_TRUE(persistent_storage.tryBeginResolution(&owner));
+    persistent_storage.recordResolvedTransientTableFunction(storageID(42), "MergeTree", {});
+    persistent_storage.markResolutionComplete(&owner);
+    EXPECT_FALSE(persistent_storage.snapshotIfComplete().has_value());
+}
+
 TEST(UDTQueryCacheDependencies, ResolutionOwnerExceptionAndLateStorageInvalidateProof)
 {
     QueryResultCacheStorageDependencyCollector collector(true);

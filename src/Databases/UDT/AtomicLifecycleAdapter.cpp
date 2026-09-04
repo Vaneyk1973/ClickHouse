@@ -1564,13 +1564,13 @@ std::shared_ptr<void> AtomicLifecycleAdapter::acquireTableIntrospectionLease(
 {
     struct Lease final
     {
-        Lease(IStorage::AlterLockHolder table_alter_lock_, std::unique_lock<std::mutex> schema_lock_)
+        Lease(std::optional<IStorage::AlterLockHolder> table_alter_lock_, std::unique_lock<std::mutex> schema_lock_)
             : table_alter_lock(std::move(table_alter_lock_))
             , schema_lock(std::move(schema_lock_))
         {
         }
 
-        IStorage::AlterLockHolder table_alter_lock;
+        std::optional<IStorage::AlterLockHolder> table_alter_lock;
         std::unique_lock<std::mutex> schema_lock;
     };
 
@@ -1599,6 +1599,46 @@ std::shared_ptr<void> AtomicLifecycleAdapter::acquireTableIntrospectionLease(
         std::this_thread::sleep_for(std::max(std::chrono::milliseconds(1), std::min(cancellation_poll_interval, remaining)));
     };
 
+    const auto acquire_schema_lock = [&]
+    {
+        std::unique_lock<std::mutex> schema_lock(database.udt_schema_mutation_mutex, std::defer_lock);
+        while (!schema_lock.try_lock())
+            wait_for_lock("schema lock");
+        return schema_lock;
+    };
+
+    const auto get_outer_metadata = [&]
+    {
+        auto metadata = table->IStorage::getInMemoryMetadataPtr(nullptr, true);
+        if (!metadata)
+            throw Exception(ErrorCodes::ABORTED, "Atomic user-defined type introspection received no table metadata snapshot");
+        metadata->validateBoundUDTReferences();
+        return metadata;
+    };
+    const auto has_outer_udt_binding = [](const StorageMetadataPtr & metadata)
+    {
+        return static_cast<bool>(metadata->getBoundUDTReferences()) || static_cast<bool>(metadata->getBoundUDTExpectation());
+    };
+
+    /// Ordinary physical tables do not need the storage ALTER lock: SHOW may
+    /// read the last published metadata while an ALTER is still computing its
+    /// next image. Pin the database schema boundary briefly and recheck both
+    /// the outer metadata and the database-owned UUID inventory under it. A
+    /// physical-to-mapped publication gap is therefore redirected to the full
+    /// ALTER -> schema path instead of being exposed as a physical snapshot.
+    auto metadata = get_outer_metadata();
+    if (!has_outer_udt_binding(metadata))
+    {
+        auto schema_lock = acquire_schema_lock();
+        metadata = get_outer_metadata();
+        if (!has_outer_udt_binding(metadata) && !database.hasDatabaseOwnedUDTObject(table->getStorageID().uuid))
+        {
+            if (check_cancellation)
+                check_cancellation();
+            return std::make_shared<Lease>(std::nullopt, std::move(schema_lock));
+        }
+    }
+
     /// ALTER holds this lock for its entire storage callback, including both
     /// the durable authority commit and the final live-metadata publication.
     /// The caller already retains the table share lock. Taking ALTER before
@@ -1614,17 +1654,23 @@ std::shared_ptr<void> AtomicLifecycleAdapter::acquireTableIntrospectionLease(
             wait_for_lock("table ALTER lock");
     }
 
-    std::unique_lock<std::mutex> schema_lock;
-    const auto metadata = table->getInMemoryMetadataPtr(nullptr, false);
-    if (metadata->getBoundUDTReferences())
+    /// Durable bindings belong to the outer storage. In particular, Alias
+    /// forwards its virtual metadata lookup to the target; treating that as
+    /// the Alias object's binding would lock and expose the wrong authority.
+    auto schema_lock = acquire_schema_lock();
+    metadata = get_outer_metadata();
+    const bool has_outer_binding = has_outer_udt_binding(metadata);
+    const bool has_database_owned_object = database.hasDatabaseOwnedUDTObject(table->getStorageID().uuid);
+    if (has_outer_binding != has_database_owned_object)
     {
-        schema_lock = std::unique_lock<std::mutex>(database.udt_schema_mutation_mutex, std::defer_lock);
-        while (!schema_lock.try_lock())
-            wait_for_lock("schema lock");
+        throw Exception(
+            ErrorCodes::ABORTED,
+            "Atomic user-defined type introspection found a persistent live/durable binding mismatch for table {}",
+            table->getStorageID().getNameForLogs());
     }
     if (check_cancellation)
         check_cancellation();
-    return std::make_shared<Lease>(std::move(*table_alter_lock), std::move(schema_lock));
+    return std::make_shared<Lease>(std::move(table_alter_lock), std::move(schema_lock));
 }
 
 std::unique_ptr<const ILifecycleSnapshot> AtomicLifecycleAdapter::acquireSnapshot() const

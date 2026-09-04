@@ -46,8 +46,7 @@ private:
         ASTPtr & ast,
         ContextPtr context_,
         bool reject_stored_udt_syntax_in_function_bodies,
-        size_t * remaining_inspection_nodes,
-        size_t depth);
+        size_t * remaining_inspection_nodes);
 
     static ASTPtr tryToReplaceFunction(
         const ASTFunction & function,

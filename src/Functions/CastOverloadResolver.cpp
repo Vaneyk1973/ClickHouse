@@ -482,7 +482,7 @@ SELECT accurateCastOrNull('abc', 'UInt32')
 
 FunctionOverloadResolverPtr createCastOverloadResolver(ContextPtr context, CastType cast_type, std::optional<CastDiagnostic> diagnostic)
 {
-    return CastOverloadResolverImpl::create(context, cast_type, false, std::move(diagnostic));
+    return createCastOverloadResolver(context, cast_type, false, std::move(diagnostic));
 }
 
 }

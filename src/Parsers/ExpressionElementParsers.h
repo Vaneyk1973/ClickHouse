@@ -4,6 +4,7 @@
 #include <Core/MultiEnum.h>
 #include <Parsers/IParserBase.h>
 
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -569,7 +570,17 @@ struct ParsedCastDataType
     String ordinary_type_text;
 };
 
-bool parseCastDataType(IParser::Pos & pos, ParsedCastDataType & parsed_type, Expected & expected);
+enum class CastDataTypeParseMode : uint8_t
+{
+    CompleteTarget,
+    PostfixOperator,
+};
+
+bool parseCastDataType(
+    IParser::Pos & pos,
+    ParsedCastDataType & parsed_type,
+    Expected & expected,
+    CastDataTypeParseMode mode = CastDataTypeParseMode::CompleteTarget);
 void discardCastDataType(ParsedCastDataType & parsed_type, Expected & expected);
 ASTPtr createCastTypeArgument(ParsedCastDataType parsed_type);
 ASTPtr createFunctionCast(const ASTPtr & expr_ast, ParsedCastDataType parsed_type);

@@ -296,6 +296,42 @@ TEST(UDTFeatureGate, PersistedOrDispatchedExpressionsStopAtFactoryRouting)
     }
 }
 
+TEST(UDTFeatureGate, ExecutionOutputSettingsAreNotTreatedAsPersistedTypeStrings)
+{
+    const auto options = UDT::UDTExecutionBoundaryOptions{
+        .allow_experimental_analyzer = false,
+        .allow_experimental_user_defined_types = true,
+    };
+
+    const auto validate = [&](const String & query_text)
+    {
+        auto query = parseStatement(query_text);
+        static_cast<void>(UDT::validateUDTExecutionBoundary(query, options));
+    };
+    const auto validate_with_size = [&](const String & query_text)
+    {
+        auto query = parseStatement(query_text);
+        static_cast<void>(UDT::validateUDTExecutionBoundaryAndSize(query, 10'000, options));
+    };
+
+    const String transient
+        = "DESCRIBE TABLE numbers(1) SETTINGS schema_inference_hints = 'id app.UserId'";
+    EXPECT_NO_THROW(validate(transient));
+    EXPECT_NO_THROW(validate_with_size(transient));
+
+    static constexpr std::array persisted_or_session_settings{
+        std::string_view{"SET schema_inference_hints = 'id app.UserId'"},
+        std::string_view{"CREATE VIEW app.v AS SELECT 1 SETTINGS schema_inference_hints = 'id app.UserId'"},
+        std::string_view{"ALTER TABLE app.mv MODIFY QUERY SELECT 1 SETTINGS schema_inference_hints = 'id app.UserId'"},
+    };
+    for (const auto query_text : persisted_or_session_settings)
+    {
+        SCOPED_TRACE(query_text);
+        expectSupportIsDisabled([&] { validate(String{query_text}); }, query_text);
+        expectSupportIsDisabled([&] { validate_with_size(String{query_text}); }, query_text);
+    }
+}
+
 TEST(UDTFeatureGate, NonConstantPersistedCastTargetsStopBeforeInterpreterRouting)
 {
     auto context = Context::createCopy(getContext().context);

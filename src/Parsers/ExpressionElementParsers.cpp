@@ -603,9 +603,31 @@ DataTypeFamilyClassification classifyCastTypeSyntax(const void *, std::string_vi
 }
 }
 
-bool parseCastDataType(IParser::Pos & pos, ParsedCastDataType & parsed_type, Expected & expected)
+bool parseCastDataType(
+    IParser::Pos & pos, ParsedCastDataType & parsed_type, Expected & expected, CastDataTypeParseMode mode)
 {
     const IParser::Pos type_begin = pos;
+
+    /// In postfix syntax, a bare JSON target is immediately followed by its
+    /// first path component. Qualified UDT syntax made that same token sequence
+    /// look like database `JSON`, type `<component>`. Preserve the established
+    /// expression interpretation here only; CAST(... AS JSON.a) remains a
+    /// complete qualified target, while quoting `JSON` still forces UDT syntax.
+    if (mode == CastDataTypeParseMode::PostfixOperator && pos->type == TokenType::BareWord
+        && equalsCaseInsensitive(std::string_view(pos->begin, pos->size()), "JSON"))
+    {
+        auto after_type = pos;
+        ++after_type;
+        if (after_type->type == TokenType::Dot)
+        {
+            ParsedCastDataType result;
+            result.ordinary_type_text.assign(pos->begin, pos->size());
+            ++pos;
+            parsed_type = std::move(result);
+            return true;
+        }
+    }
+
     ASTPtr type_ast;
     DataTypeFamilyClassificationSummary summary;
     ParserDataTypeWithFamilyClassification parser(
@@ -1181,7 +1203,7 @@ bool ParserCastOperator::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
         return false;
 
     ParsedCastDataType parsed_type;
-    if (!parseCastDataType(pos, parsed_type, expected))
+    if (!parseCastDataType(pos, parsed_type, expected, CastDataTypeParseMode::PostfixOperator))
         return false;
 
     if (string_literal)

@@ -5051,6 +5051,10 @@ void QueryAnalyzer::resolveTableFunction(QueryTreeNodePtr & table_function_node,
 
         if (parameterized_view_storage)
         {
+            auto invocation_ast = table_function_node_typed.getOriginalAST();
+            if (!invocation_ast)
+                invocation_ast = table_function_node_typed.toAST();
+            scope_context->observeUDTTableFunctionStorage(invocation_ast, parameterized_view_storage);
             VectorWithMemoryTracking<size_t> skip_analysis_arguments_indexes(table_function_node_typed.getArguments().getNodes().size());
             std::iota(skip_analysis_arguments_indexes.begin(), skip_analysis_arguments_indexes.end(), 0);
             table_function_node_typed.resolve({}, parameterized_view_storage, scope_context, std::move(skip_analysis_arguments_indexes));
@@ -5058,12 +5062,22 @@ void QueryAnalyzer::resolveTableFunction(QueryTreeNodePtr & table_function_node,
             {
                 const auto & storage = table_function_node_typed.getStorageOrThrow();
                 const auto & snapshot = table_function_node_typed.getStorageSnapshot();
-                collector->record(
-                    table_function_node_typed.getStorageID(),
-                    storage->getName(),
-                    UDT::QueryResultCacheStorageKind::View,
-                    snapshot->metadata->getBoundUDTReferences(),
-                    snapshot->udt_read_continuation_evidence);
+                const auto & storage_id = table_function_node_typed.getStorageID();
+                const auto & bound_references = snapshot->metadata->getBoundUDTReferences();
+                if (!storage_id.hasUUID() && !bound_references && !snapshot->udt_read_continuation_evidence)
+                {
+                    collector->recordResolvedTransientTableFunction(
+                        storage_id, storage->getName(), bound_references, snapshot->udt_read_continuation_evidence);
+                }
+                else
+                {
+                    collector->record(
+                        storage_id,
+                        storage->getName(),
+                        UDT::QueryResultCacheStorageKind::View,
+                        bound_references,
+                        snapshot->udt_read_continuation_evidence);
+                }
             }
             return;
         }
@@ -5470,18 +5484,32 @@ void QueryAnalyzer::resolveTableFunction(QueryTreeNodePtr & table_function_node,
         }
     }
     auto table_function_storage = scope_context->getQueryContext()->executeTableFunction(table_function_ast, table_function_ptr, execution_context);
+    auto exact_invocation_ast = table_function_node_typed.getOriginalAST();
+    if (!exact_invocation_ast)
+        exact_invocation_ast = table_function_ast;
+    scope_context->observeUDTTableFunctionStorage(exact_invocation_ast, table_function_storage);
     table_function_node_typed.resolve(std::move(table_function_ptr), std::move(table_function_storage), scope_context, std::move(skip_analysis_arguments_indexes));
     if (const auto collector = scope_context->getUDTQueryResultCacheStorageDependencyCollector())
     {
         const auto & storage = table_function_node_typed.getStorageOrThrow();
         const auto & snapshot = table_function_node_typed.getStorageSnapshot();
         const auto kind = storage->isView() ? UDT::QueryResultCacheStorageKind::View : UDT::QueryResultCacheStorageKind::Storage;
-        collector->record(
-            table_function_node_typed.getStorageID(),
-            storage->getName(),
-            kind,
-            snapshot->metadata->getBoundUDTReferences(),
-            snapshot->udt_read_continuation_evidence);
+        const auto & storage_id = table_function_node_typed.getStorageID();
+        const auto & bound_references = snapshot->metadata->getBoundUDTReferences();
+        if (!storage_id.hasUUID() && !bound_references && !snapshot->udt_read_continuation_evidence)
+        {
+            collector->recordResolvedTransientTableFunction(
+                storage_id, storage->getName(), bound_references, snapshot->udt_read_continuation_evidence);
+        }
+        else
+        {
+            collector->record(
+                storage_id,
+                storage->getName(),
+                kind,
+                bound_references,
+                snapshot->udt_read_continuation_evidence);
+        }
     }
 }
 

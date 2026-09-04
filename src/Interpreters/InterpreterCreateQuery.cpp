@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <array>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -57,11 +60,14 @@
 #include <Storages/MaterializedView/RefreshSet.h>
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/StorageFromMergeTreeProjection.h>
 #include <Storages/StorageAlias.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageInMemoryMetadata.h>
+#include <Storages/StorageLoop.h>
 #include <Storages/StorageMaterializedView.h>
 #include <Storages/StorageMerge.h>
+#include <Storages/StorageMergeTreeIndex.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/StorageView.h>
 #include <Storages/TableLockHolder.h>
@@ -131,6 +137,8 @@
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionVisitor.h>
 
+#include <base/scope_guard.h>
+
 
 namespace CurrentMetrics
 {
@@ -191,6 +199,7 @@ extern const char atomic_populate_fail_before_subscription[];
 extern const char atomic_populate_pause_before_subscription[];
 extern const char atomic_populate_pause_after_view_publication[];
 extern const char atomic_populate_pause_before_source_guard[];
+extern const char udt_inferred_schema_pause_after_legacy_analysis[];
 }
 
 namespace ErrorCodes
@@ -898,17 +907,146 @@ UDT::StoredObjectCreatePreparationDecision classifyStoredObjectUDTCreate(
 /// proven physical-only before inference. This walk is deliberately based on
 /// catalog storages and DatabaseAtomic's UUID-owned authority state: rebuilding
 /// identity from an already-lowered IDataType would silently lose provenance.
+class UDTTableFunctionSourceHandoff final
+{
+public:
+    void record(const ASTPtr & invocation, const StoragePtr & storage, const String & current_database)
+    {
+        if (!invocation || !storage)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot retain an incomplete inferred-schema table-function source");
+
+        std::lock_guard lock(mutex);
+        auto & entries = storages[makeKey(invocation, current_database)];
+        if (std::find(entries.begin(), entries.end(), storage) != entries.end())
+            return;
+        if (entry_count >= maximum_entries)
+        {
+            throw Exception(
+                ErrorCodes::TOO_MANY_TABLES,
+                "Cannot retain more than {} table-function sources while inferring a physical-only CREATE schema",
+                maximum_entries);
+        }
+        entries.push_back(storage);
+        ++entry_count;
+    }
+
+    std::vector<StoragePtr> snapshot(const ASTPtr & invocation, const String & current_database) const
+    {
+        if (!invocation)
+            return {};
+        std::lock_guard lock(mutex);
+        const auto it = storages.find(makeKey(invocation, current_database));
+        return it == storages.end() ? std::vector<StoragePtr>{} : it->second;
+    }
+
+private:
+    static constexpr size_t maximum_entries = 4096;
+
+    static String makeKey(const ASTPtr & invocation, const String & current_database)
+    {
+        return toString(current_database.size()) + ':' + current_database
+            + toString(invocation->getTreeHash(/*ignore_aliases=*/ true));
+    }
+
+    mutable std::mutex mutex;
+    std::unordered_map<String, std::vector<StoragePtr>> storages;
+    size_t entry_count = 0;
+};
+
+class UDTAliasResolutionHandoff final
+{
+public:
+    struct Observation
+    {
+        StoragePtr target;
+        StorageID target_id_at_observation;
+        StorageMetadataPtr metadata;
+    };
+
+    void record(
+        const StorageID & source_alias_id,
+        const StoragePtr & target,
+        const StorageID & target_id_at_observation,
+        const StorageMetadataPtr & metadata)
+    {
+        if (!target)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot retain an incomplete inferred-schema Alias resolution");
+
+        std::lock_guard lock(mutex);
+        auto & entries = observations[makeKey(source_alias_id)];
+        const auto duplicate = std::find_if(
+            entries.begin(),
+            entries.end(),
+            [&](const auto & entry)
+            {
+                return entry.target == target && entry.metadata == metadata
+                    && entry.target_id_at_observation.getDatabaseName() == target_id_at_observation.getDatabaseName()
+                    && entry.target_id_at_observation.getTableName() == target_id_at_observation.getTableName();
+            });
+        if (duplicate != entries.end())
+            return;
+        if (entry_count >= maximum_entries)
+        {
+            throw Exception(
+                ErrorCodes::TOO_MANY_TABLES,
+                "Cannot retain more than {} Alias resolutions while inferring a physical-only CREATE schema",
+                maximum_entries);
+        }
+        entries.push_back({target, target_id_at_observation, metadata});
+        ++entry_count;
+    }
+
+    std::vector<Observation> snapshot(const StorageID & source_alias_id) const
+    {
+        std::lock_guard lock(mutex);
+        const auto it = observations.find(makeKey(source_alias_id));
+        return it == observations.end() ? std::vector<Observation>{} : it->second;
+    }
+
+    static String makeKey(const StorageID & source_alias_id)
+    {
+        const auto & database = source_alias_id.getDatabaseName();
+        return toString(database.size()) + ':' + database + source_alias_id.getTableName();
+    }
+
+private:
+    static constexpr size_t maximum_entries = 4096;
+
+    mutable std::mutex mutex;
+    std::unordered_map<String, std::vector<Observation>> observations;
+    size_t entry_count = 0;
+};
+
 class UDTPhysicalSchemaSourceGuard final
 {
 public:
-    /// Native AS/CLONE copies the selected storage's own immutable metadata;
-    /// wrappers below it do not contribute another schema. Keep this check
-    /// direct so an explicitly physical view/alias remains copyable even when
-    /// its ordinary runtime query happens to read a mapped table.
-    void assertNativePhysicalSchemaSource(const StoragePtr & storage, const ContextPtr & source_context)
+    explicit UDTPhysicalSchemaSourceGuard(
+        std::shared_ptr<UDTTableFunctionSourceHandoff> table_function_handoff_ = {},
+        std::shared_ptr<UDTAliasResolutionHandoff> alias_resolution_handoff_ = {})
+        : table_function_handoff(std::move(table_function_handoff_))
+        , alias_resolution_handoff(std::move(alias_resolution_handoff_))
+    {
+    }
+
+    /// Native AS/CLONE copies this exact immutable metadata snapshot. Most
+    /// storages own that schema, but Alias exposes its current target's
+    /// metadata instead, so retain the snapshot's provenance and follow only
+    /// that dynamic Alias edge before accepting a physical-only copy.
+    void assertNativePhysicalSchemaSource(
+        const StoragePtr & storage, const StorageMetadataPtr & copied_metadata, const ContextPtr & source_context)
     {
         resetTraversal();
-        assertDirectStorageIsPhysicalOnly(storage, source_context);
+        inspectNativeStorage(storage, source_context);
+        assertCapturedMetadataIsPhysicalOnly(storage, copied_metadata);
+    }
+
+    /// Resolve every dynamic Alias edge only after authorizing that exact
+    /// target, retain the resolved storages for the duration of the copy, and
+    /// return the immutable metadata snapshot that the native copy may use.
+    StorageMetadataPtr captureNativePhysicalSchemaSource(const StoragePtr & storage, const ContextPtr & source_context)
+    {
+        resetTraversal();
+        return captureNativeStorageMetadata(storage, source_context);
     }
 
     /// ExpressionAnalyzer does not retain a resolved query tree. Run this
@@ -952,6 +1090,8 @@ public:
             if (const auto * table = node->as<TableNode>())
             {
                 inspectStorage(table->getStorage(), source_context);
+                const auto & snapshot = table->getStorageSnapshot();
+                assertCapturedMetadataIsPhysicalOnly(table->getStorage(), snapshot ? snapshot->metadata : StorageMetadataPtr{});
             }
             else if (const auto * table_function = node->as<TableFunctionNode>())
             {
@@ -962,11 +1102,49 @@ public:
                         "Cannot infer a physical-only CREATE schema because a local table-function source was not resolved exhaustively");
                 }
                 inspectStorage(table_function->getStorage(), source_context);
+                const auto & snapshot = table_function->getStorageSnapshot();
+                assertCapturedMetadataIsPhysicalOnly(
+                    table_function->getStorage(), snapshot ? snapshot->metadata : StorageMetadataPtr{});
             }
 
-            for (const auto & child : node->getChildren())
-                if (child)
-                    pending.push_back(child);
+            appendResolvedQueryTreeChildren(node, pending);
+        }
+    }
+
+    /// Selected-output binding can preserve provenance from a storage that
+    /// owns its snapshot. Alias owns no schema, so never let its target's
+    /// binding masquerade as Alias-owned provenance even when logical output
+    /// collection is enabled.
+    void assertResolvedDynamicAliasClosure(const QueryTreeNodePtr & query_tree, const ContextPtr & source_context)
+    {
+        resetTraversal();
+        if (!query_tree)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot inspect an empty resolved inferred-schema query");
+
+        std::unordered_set<const IQueryTreeNode *> visited;
+        std::vector<QueryTreeNodePtr> pending{query_tree};
+        while (!pending.empty())
+        {
+            auto node = std::move(pending.back());
+            pending.pop_back();
+            if (!node || !visited.emplace(node.get()).second)
+                continue;
+            if (visited.size() > maximum_query_tree_nodes)
+            {
+                throw Exception(
+                    ErrorCodes::TOO_MANY_TABLES,
+                    "Cannot inspect more than {} resolved query-tree nodes while inferring a physical-only CREATE schema",
+                    maximum_query_tree_nodes);
+            }
+
+            if (const auto * table = node->as<TableNode>(); table && table->getStorage()->as<StorageAlias>())
+            {
+                inspectStorage(table->getStorage(), source_context);
+                const auto & snapshot = table->getStorageSnapshot();
+                assertCapturedMetadataIsPhysicalOnly(table->getStorage(), snapshot ? snapshot->metadata : StorageMetadataPtr{});
+            }
+
+            appendResolvedQueryTreeChildren(node, pending);
         }
     }
 
@@ -975,23 +1153,58 @@ private:
     static constexpr size_t maximum_ast_nodes = 65'536;
     static constexpr size_t maximum_query_tree_nodes = 65'536;
 
+    static void appendResolvedQueryTreeChildren(
+        const QueryTreeNodePtr & node, std::vector<QueryTreeNodePtr> & pending)
+    {
+        const auto * table_function = node->as<TableFunctionNode>();
+        for (const auto & child : node->getChildren())
+        {
+            if (!child)
+                continue;
+            if (!table_function || child != table_function->getArgumentsNode())
+            {
+                pending.push_back(child);
+                continue;
+            }
+
+            /// QueryAnalyzer deliberately leaves remote-owned or otherwise
+            /// opaque table-function arguments unresolved. Its ordinary query
+            /// tree traversals omit exactly those argument edges; follow the
+            /// same source closure here while keeping every resolved edge.
+            const auto & unresolved_indexes = table_function->getUnresolvedArgumentIndexes();
+            const auto & arguments = table_function->getArguments().getNodes();
+            for (size_t index = 0; index < arguments.size(); ++index)
+            {
+                if (std::find(unresolved_indexes.begin(), unresolved_indexes.end(), index) == unresolved_indexes.end())
+                    pending.push_back(arguments[index]);
+            }
+        }
+    }
+
     void resetTraversal()
     {
         visited_storages.clear();
-        visited_ast_nodes.clear();
+        consumed_alias_observation_sources.clear();
         inspected_storage_edges = 0;
+        inspected_ast_nodes = 0;
     }
 
     void inspectAuthorizedNormalizedAST(const ASTPtr & query, const ContextPtr & source_context)
     {
+        /// Raw AST addresses are valid only while this query owner is alive.
+        /// A nested transient view owns a different temporary clone, so do not
+        /// retain its addresses after this traversal returns: an allocator may
+        /// reuse them for a later clone and make an unvisited subtree appear
+        /// visited. Keep only the aggregate bound across nested traversals.
+        std::unordered_set<const IAST *> visited;
         std::vector<const IAST *> pending{query.get()};
         while (!pending.empty())
         {
             const IAST * node = pending.back();
             pending.pop_back();
-            if (!node || !visited_ast_nodes.emplace(node).second)
+            if (!node || !visited.emplace(node).second)
                 continue;
-            if (visited_ast_nodes.size() > maximum_ast_nodes)
+            if (++inspected_ast_nodes > maximum_ast_nodes)
             {
                 throw Exception(
                     ErrorCodes::TOO_MANY_TABLES,
@@ -1010,6 +1223,7 @@ private:
                     /// grant fails without revealing mapped authority state.
                     source_context->checkAccess(AccessType::SELECT, table_id.getDatabaseName(), table_id.getTableName());
                     inspectStorage(DatabaseCatalog::instance().getTable(table_id, source_context), source_context);
+                    inspectObservedAliasResolutions(table_id, source_context);
                 }
                 else if (table_expression->table_function)
                     inspectAuthorizedTableFunction(table_expression->table_function, source_context);
@@ -1034,6 +1248,13 @@ private:
         if (!function)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "A table-function source has a malformed AST");
 
+        /// The analyzer gives registered table functions precedence over a
+        /// same-named parameterized view. ExpressionAnalyzer has the opposite
+        /// legacy precedence, so only the analyzer path skips this lookup.
+        if (source_context->getSettingsRef()[Setting::allow_experimental_analyzer]
+            && TableFunctionFactory::instance().isTableFunctionName(function->name))
+            return false;
+
         String database_name = source_context->getCurrentDatabase();
         String table_name = function->name;
         if (function->isCompoundName())
@@ -1051,14 +1272,62 @@ private:
         if (view && view->isParameterizedView())
         {
             source_context->checkAccess(AccessType::SELECT, database_name, table_name);
-            inspectStorage(storage, source_context);
-            return true;
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot infer a physical-only CREATE schema because the exact parameterized view invocation was not retained");
         }
         return false;
     }
 
     void inspectAuthorizedTableFunction(const ASTPtr & table_function_ast, const ContextPtr & source_context)
     {
+        if (table_function_handoff)
+        {
+            auto observed_storages = table_function_handoff->snapshot(
+                table_function_ast, source_context->getCurrentDatabase());
+            if (!observed_storages.empty())
+            {
+                const auto * function = table_function_ast->as<ASTFunction>();
+                if (!function)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "A table-function source has a malformed AST");
+                String expected_database = source_context->getCurrentDatabase();
+                String expected_table = function->name;
+                if (function->isCompoundName())
+                {
+                    std::vector<String> name_parts;
+                    splitInto<'.'>(name_parts, function->name);
+                    if (name_parts.size() == 2)
+                    {
+                        expected_database = std::move(name_parts[0]);
+                        expected_table = std::move(name_parts[1]);
+                    }
+                }
+
+                bool inspected_observation = false;
+                for (const auto & observed : observed_storages)
+                {
+                    if (const auto * observed_view = observed ? observed->as<StorageView>() : nullptr;
+                        observed_view && observed_view->isParameterizedView())
+                    {
+                        const auto & observed_id = observed->getStorageID();
+                        if (observed_id.getDatabaseName() != expected_database
+                            || observed_id.getTableName() != expected_table)
+                        {
+                            throw Exception(
+                                ErrorCodes::NOT_IMPLEMENTED,
+                                "Cannot infer a physical-only CREATE schema because a parameterized view invocation changed identity");
+                        }
+                        source_context->checkAccess(
+                            AccessType::SELECT, observed_id.getDatabaseName(), observed_id.getTableName());
+                    }
+                    inspectStorage(observed, source_context);
+                    inspected_observation = true;
+                }
+                if (inspected_observation)
+                    return;
+            }
+        }
+
         if (inspectCatalogParameterizedView(table_function_ast, source_context))
             return;
 
@@ -1079,6 +1348,50 @@ private:
         inspectStorageAfterCount(storage, source_context);
     }
 
+    void inspectObservedAliasResolutions(const StorageID & source_alias_id, const ContextPtr & source_context)
+    {
+        if (!alias_resolution_handoff)
+            return;
+
+        const auto source_key = UDTAliasResolutionHandoff::makeKey(source_alias_id);
+        if (!consumed_alias_observation_sources.emplace(source_key).second)
+            return;
+
+        for (const auto & observation : alias_resolution_handoff->snapshot(source_alias_id))
+        {
+            const auto & target_id = observation.target_id_at_observation;
+            if (target_id.getDatabaseName().empty() || target_id.getTableName().empty())
+            {
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot infer a physical-only CREATE schema because an observed Alias target has no stable catalog identity");
+            }
+
+            /// The callback only retained opaque identity. Preserve ordinary
+            /// access ordering before inspecting either the target's current
+            /// authority or the exact metadata consumed during analysis.
+            source_context->checkAccess(AccessType::SELECT, target_id.getDatabaseName(), target_id.getTableName());
+            const auto current_target_id = observation.target->getStorageID();
+            if (current_target_id.getDatabaseName().empty() || current_target_id.getTableName().empty())
+            {
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot infer a physical-only CREATE schema because an observed Alias target lost its catalog identity");
+            }
+            if (current_target_id.getDatabaseName() != target_id.getDatabaseName()
+                || current_target_id.getTableName() != target_id.getTableName())
+            {
+                source_context->checkAccess(
+                    AccessType::SELECT, current_target_id.getDatabaseName(), current_target_id.getTableName());
+            }
+            inspectStorage(observation.target, source_context);
+            assertCapturedMetadataIsPhysicalOnly(observation.target, observation.metadata);
+
+            if (observation.target->as<StorageAlias>())
+                inspectObservedAliasResolutions(target_id, source_context);
+        }
+    }
+
     void countStorageEdge()
     {
         if (++inspected_storage_edges > maximum_storage_edges)
@@ -1087,6 +1400,67 @@ private:
                 ErrorCodes::TOO_MANY_TABLES,
                 "Cannot inspect more than {} local source-storage edges while inferring a physical-only CREATE schema",
                 maximum_storage_edges);
+        }
+    }
+
+    void inspectNativeStorage(const StoragePtr & storage, const ContextPtr & source_context)
+    {
+        countStorageEdge();
+        if (!storage)
+        {
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED, "Cannot infer a physical-only CREATE schema because a local source storage is unavailable");
+        }
+        if (!visited_storages.emplace(storage).second)
+            return;
+
+        assertDirectStorageIsPhysicalOnly(storage, source_context);
+        if (const auto * alias = storage->as<StorageAlias>())
+        {
+            inspectNativeStorage(
+                alias->getTargetTable(StorageAlias::TargetAccess{source_context, AccessType::SHOW_COLUMNS}), source_context);
+        }
+    }
+
+    StorageMetadataPtr captureNativeStorageMetadata(const StoragePtr & storage, const ContextPtr & source_context)
+    {
+        countStorageEdge();
+        if (!storage)
+        {
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED, "Cannot infer a physical-only CREATE schema because a local source storage is unavailable");
+        }
+        if (!visited_storages.emplace(storage).second)
+        {
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot infer or copy a physical-only CREATE schema through a cyclic Alias source");
+        }
+
+        assertDirectStorageIsPhysicalOnly(storage, source_context);
+        if (const auto * alias = storage->as<StorageAlias>())
+        {
+            return captureNativeStorageMetadata(
+                alias->getTargetTable(StorageAlias::TargetAccess{source_context, AccessType::SHOW_COLUMNS}), source_context);
+        }
+
+        auto metadata_handle = storage->getInMemoryMetadataPtr(source_context, false);
+        StorageMetadataPtr metadata = metadata_handle;
+        assertCapturedMetadataIsPhysicalOnly(storage, metadata);
+        return metadata;
+    }
+
+    static void assertCapturedMetadataIsPhysicalOnly(const StoragePtr & storage, const StorageMetadataPtr & metadata)
+    {
+        if (!storage || !metadata)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Inferred-schema source has no immutable metadata snapshot");
+        metadata->validateBoundUDTReferences();
+        if (metadata->getBoundUDTReferences())
+        {
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot infer or copy a physical-only CREATE schema from mapped table metadata exposed by {}",
+                storage->getStorageID().getNameForLogs());
         }
     }
 
@@ -1115,26 +1489,113 @@ private:
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED, "Cannot infer a physical-only CREATE schema because a local source storage is unavailable");
         }
-        if (!visited_storages.emplace(storage.get()).second)
+        /// Retain every visited storage until the traversal ends. A catalog
+        /// DETACH/replace may otherwise destroy a child after this call and
+        /// let a later storage reuse the same raw address, which would make an
+        /// uninspected source look visited.
+        if (!visited_storages.emplace(storage).second)
             return;
+
+        if (const auto * view = storage->as<StorageView>())
+        {
+            const auto & view_id = storage->getStorageID();
+            auto catalog_view = view_id.getDatabaseName().empty()
+                ? StoragePtr{}
+                : DatabaseCatalog::instance().tryGetTable(view_id, source_context);
+            if (catalog_view.get() == storage.get())
+            {
+                /// A catalog View exposes its own fixed columns and carries any
+                /// durable binding on that outer storage. A table function can
+                /// also return a transient StorageView; that object's sample
+                /// still comes from its inner query and must be inspected.
+                if (view->isParameterizedView())
+                {
+                    throw Exception(
+                        ErrorCodes::NOT_IMPLEMENTED,
+                        "Cannot infer a physical-only CREATE schema because the exact parameterized view invocation was not retained");
+                }
+                assertDirectStorageIsPhysicalOnly(storage, source_context);
+                return;
+            }
+
+            /// A parameterized view invocation and a view table function both
+            /// produce a transient StorageView whose physical sample block was
+            /// inferred from the exact inner query and has no durable binding.
+            /// Inspect that exact substituted query under the view's effective
+            /// SQL-security context before accepting its inferred schema.
+            auto metadata = storage->IStorage::getInMemoryMetadataPtr(source_context, true);
+            if (!metadata || !metadata->getSelectQuery().inner_query)
+            {
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot infer a physical-only CREATE schema because a parameterized view query is unavailable");
+            }
+            ASTPtr normalized = metadata->getSelectQuery().inner_query->clone();
+            ApplyWithSubqueryVisitor::visit(normalized);
+            inspectAuthorizedNormalizedAST(normalized, metadata->getSQLSecurityOverriddenContext(source_context));
+            return;
+        }
 
         assertDirectStorageIsPhysicalOnly(storage, source_context);
 
-        if (storage->as<StorageView>())
+        if (storage->as<StorageMaterializedView>())
         {
-            /// The new analyzer removes an authorized/inlined view from the
-            /// resolved tree. Seeing StorageView here means normal analysis
-            /// retained an opaque SQL-security boundary. Catalog-walking its
-            /// hidden inner AST would both bypass access ordering and reveal
-            /// mapped state, so fail identically for every such view.
-            throw Exception(
-                ErrorCodes::NOT_IMPLEMENTED,
-                "Cannot infer a physical-only CREATE schema through a view whose authorized source closure was not resolved");
+            /// MaterializedView likewise exposes its own persisted outer
+            /// columns; its target contributes data, not another schema.
+            return;
         }
 
-        if (storage->as<StorageMaterializedView>() || storage->as<StorageAlias>())
-            throw Exception(
-                ErrorCodes::NOT_IMPLEMENTED, "Cannot infer a physical-only CREATE schema through an opaque local storage wrapper");
+        if (const auto * alias = storage->as<StorageAlias>())
+        {
+            /// Alias has no independent schema: its metadata is obtained from
+            /// the target on every access. Follow exactly that schema edge,
+            /// but require the same conservative table-wide SELECT before
+            /// inspecting the target's UDT authority state.
+            inspectStorage(
+                alias->getTargetTable(StorageAlias::TargetAccess{source_context, AccessType::SELECT}), source_context);
+            inspectObservedAliasResolutions(storage->getStorageID(), source_context);
+            return;
+        }
+
+        if (const auto * loop = storage->as<StorageLoop>())
+        {
+            /// TableFunctionLoop resolves and authorizes this exact source
+            /// before constructing the wrapper. Its schema and rows are both
+            /// forwarded by the inner storage, so retain and inspect that edge.
+            inspectStorage(loop->getInnerStorage(), source_context);
+            return;
+        }
+
+        if (const auto * merge_tree_index = storage->as<StorageMergeTreeIndex>())
+        {
+            /// The ordinary read path checks only the source columns selected
+            /// from the index. Schema inference has already consumed broader
+            /// source metadata, so require conservative table-wide SELECT
+            /// before inspecting its UDT authority state.
+            auto source = merge_tree_index->getSourceTable();
+            if (!source)
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot infer a physical-only CREATE schema because a MergeTree index source is unavailable");
+            source_context->checkAccess(AccessType::SELECT, source->getStorageID());
+            inspectStorage(source, source_context);
+            return;
+        }
+
+        if (const auto * projection = storage->as<StorageFromMergeTreeProjection>())
+        {
+            /// StorageFromMergeTreeProjection performs the same table-wide
+            /// access check as its first read operation. Preserve that order
+            /// before consulting the parent's logical authority.
+            auto source = projection->getParentStorage();
+            if (!source)
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot infer a physical-only CREATE schema because a MergeTree projection source is unavailable");
+            source_context->checkAccess(AccessType::SELECT, source->getStorageID());
+            inspectStorage(source, source_context);
+            return;
+        }
 
         if (const auto * merge = storage->as<StorageMerge>())
         {
@@ -1169,9 +1630,12 @@ private:
         }
     }
 
-    std::unordered_set<const IStorage *> visited_storages;
-    std::unordered_set<const IAST *> visited_ast_nodes;
+    std::unordered_set<StoragePtr> visited_storages;
+    std::unordered_set<String> consumed_alias_observation_sources;
     size_t inspected_storage_edges = 0;
+    size_t inspected_ast_nodes = 0;
+    std::shared_ptr<UDTTableFunctionSourceHandoff> table_function_handoff;
+    std::shared_ptr<UDTAliasResolutionHandoff> alias_resolution_handoff;
 };
 
 }
@@ -1262,6 +1726,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
 
         /// as_storage->getColumns() and setEngine(...) must be called under structure lock of other_table for CREATE ... AS other_table.
         StorageMetadataPtr as_storage_metadata;
+        UDTPhysicalSchemaSourceGuard source_guard;
         if (authorized_udt_source)
         {
             if (!authorized_udt_source->storage || authorized_udt_source->storage.get() != as_storage.get()
@@ -1278,8 +1743,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         {
             as_storage_lock = as_storage->lockForShare(
                 getContext()->getCurrentQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
-            auto metadata_handle = as_storage->getInMemoryMetadataPtr(getContext(), false);
-            as_storage_metadata = metadata_handle;
+            as_storage_metadata = source_guard.captureNativePhysicalSchemaSource(as_storage, getContext());
         }
 
         /// This branch copies the source's already-lowered ColumnsDescription.
@@ -1288,9 +1752,8 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         /// is therefore either observed and rejected or serialized after this
         /// physical-only capture. Explicit destination columns use the branch
         /// above and remain an ordinary physical schema.
-        UDTPhysicalSchemaSourceGuard source_guard;
         if (!authorized_udt_source)
-            source_guard.assertNativePhysicalSchemaSource(as_storage, getContext());
+            source_guard.assertNativePhysicalSchemaSource(as_storage, as_storage_metadata, getContext());
         properties.columns = as_storage_metadata->getColumns();
 
         if (!create.comment && !as_storage_metadata->comment.empty())
@@ -1386,7 +1849,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         }
         else
         {
-            source_guard.assertNativePhysicalSchemaSource(as_storage, getContext());
+            source_guard.assertNativePhysicalSchemaSource(as_storage, as_storage_metadata, getContext());
         }
     }
     else if (create.select)
@@ -1474,10 +1937,71 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
                 apply_aliases(select);
         }
 
-        SharedHeader as_select_sample;
-        UDTPhysicalSchemaSourceGuard source_guard;
+        const bool analyzer_enabled = getContext()->getSettingsRef()[Setting::allow_experimental_analyzer];
+        std::shared_ptr<UDTTableFunctionSourceHandoff> table_function_handoff;
+        std::shared_ptr<UDTAliasResolutionHandoff> alias_resolution_handoff;
+        ContextMutablePtr observer_query_context;
+        std::shared_ptr<UDT::TableFunctionStorageObserver> previous_table_function_observer;
+        std::shared_ptr<UDT::AliasResolutionObserver> previous_alias_resolution_observer;
+        bool table_function_observer_installed = false;
+        bool alias_resolution_observer_installed = false;
+        SCOPE_EXIT({
+            if (observer_query_context && table_function_observer_installed)
+                observer_query_context->setUDTTableFunctionStorageObserver(previous_table_function_observer);
+            if (observer_query_context && alias_resolution_observer_installed)
+                observer_query_context->setUDTAliasResolutionObserver(previous_alias_resolution_observer);
+        });
+        if (!collect_selected_outputs || !analyzer_enabled)
+        {
+            observer_query_context = select_context->hasQueryContext()
+                ? select_context->getQueryContext()
+                : std::const_pointer_cast<Context>(select_context);
+            auto observed_select_context = Context::createCopy(select_context);
 
-        if (getContext()->getSettingsRef()[Setting::allow_experimental_analyzer])
+            if (!collect_selected_outputs)
+            {
+                table_function_handoff = std::make_shared<UDTTableFunctionSourceHandoff>();
+                previous_table_function_observer = observer_query_context->getUDTTableFunctionStorageObserver();
+                auto table_function_observer = std::make_shared<UDT::TableFunctionStorageObserver>(
+                    [table_function_handoff, previous_observer = previous_table_function_observer](
+                        const ASTPtr & invocation, const StoragePtr & storage, const String & current_database)
+                    {
+                        table_function_handoff->record(invocation, storage, current_database);
+                        if (previous_observer)
+                            (*previous_observer)(invocation, storage, current_database);
+                    });
+                observer_query_context->setUDTTableFunctionStorageObserver(table_function_observer);
+                observed_select_context->setUDTTableFunctionStorageObserver(std::move(table_function_observer));
+                table_function_observer_installed = true;
+            }
+
+            if (!analyzer_enabled)
+            {
+                alias_resolution_handoff = std::make_shared<UDTAliasResolutionHandoff>();
+                previous_alias_resolution_observer = observer_query_context->getUDTAliasResolutionObserver();
+                auto alias_resolution_observer = std::make_shared<UDT::AliasResolutionObserver>(
+                    [alias_resolution_handoff, previous_observer = previous_alias_resolution_observer](
+                        const StorageID & source_alias_id,
+                        const StoragePtr & target,
+                        const StorageID & target_id_at_observation,
+                        const StorageMetadataPtr & metadata)
+                    {
+                        alias_resolution_handoff->record(source_alias_id, target, target_id_at_observation, metadata);
+                        if (previous_observer)
+                            (*previous_observer)(source_alias_id, target, target_id_at_observation, metadata);
+                    });
+                observer_query_context->setUDTAliasResolutionObserver(alias_resolution_observer);
+                observed_select_context->setUDTAliasResolutionObserver(std::move(alias_resolution_observer));
+                alias_resolution_observer_installed = true;
+            }
+
+            select_context = std::move(observed_select_context);
+        }
+
+        SharedHeader as_select_sample;
+        UDTPhysicalSchemaSourceGuard source_guard(table_function_handoff, alias_resolution_handoff);
+
+        if (analyzer_enabled)
         {
             SelectQueryOptions select_options;
             select_options.analyze().checkSubqueryTableAccess();
@@ -1487,13 +2011,19 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
             as_select_sample = select_interpreter.getSampleBlock();
             if (!collect_selected_outputs)
                 source_guard.assertResolvedSourceClosure(select_interpreter.getQueryTree(), select_interpreter.getContext());
+            else
+                source_guard.assertResolvedDynamicAliasClosure(select_interpreter.getQueryTree(), select_interpreter.getContext());
         }
         else
         {
             /// For refreshable materialized views, allow parameterized views in the query.
             /// This prevents the old analyzer from trying to execute table functions during analysis.
-            as_select_sample = InterpreterSelectWithUnionQuery::getSampleBlock(
-                create.select->clone(), select_context, false /* is_subquery */, is_refreshable_mv /* is_create_parameterized_view */);
+            SelectQueryOptions select_options;
+            if (is_refreshable_mv)
+                select_options = select_options.createParameterizedView();
+            select_options.analyze();
+            as_select_sample = InterpreterSelectWithUnionQuery(create.select->clone(), select_context, select_options).getSampleBlock();
+            FailPointInjection::pauseFailPoint(FailPoints::udt_inferred_schema_pause_after_legacy_analysis);
             source_guard.assertAuthorizedASTSourceClosure(create.select, select_context);
         }
 
@@ -2770,6 +3300,16 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
         auto source_bound_references = source_metadata->getBoundUDTReferences();
         if (source_bound_references)
         {
+            /// A distributed or replicated DDL worker no longer has the
+            /// initiator's indivisible source-authority proof. Re-resolving a
+            /// logical source here could therefore turn a physical native copy
+            /// into a logical sidecar copy after dispatch.
+            if (getContext()->isDDLOrOnClusterInternal())
+            {
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "A logical native Table source-sidecar copy is not supported during distributed or replicated DDL execution");
+            }
             if (stored_object_classification.source_mode == UDT::StoredObjectSourceMode::DialectLike)
             {
                 throw Exception(
@@ -4910,6 +5450,14 @@ BlockIO InterpreterCreateQuery::executeQueryOnCluster(ASTCreateQuery & create)
 
 BlockIO InterpreterCreateQuery::execute()
 {
+    auto udf_scope_context = getContext();
+    const bool previous_reject_stored_udt_syntax = udf_scope_context->shouldRejectStoredUDTSyntaxInSQLUDFBodies();
+    const bool previous_udf_substitution_frozen = udf_scope_context->isStoredObjectSQLUDFSubstitutionFrozen();
+    SCOPE_EXIT({
+        udf_scope_context->setRejectStoredUDTSyntaxInSQLUDFBodies(previous_reject_stored_udt_syntax);
+        udf_scope_context->setStoredObjectSQLUDFSubstitutionFrozen(previous_udf_substitution_frozen);
+    });
+
     if (udt_stored_object_ddl_select_boundary_handoff)
     {
         auto * create = query_ptr ? query_ptr->as<ASTCreateQuery>() : nullptr;
@@ -4991,7 +5539,7 @@ BlockIO InterpreterCreateQuery::execute()
     /// distributed DDL log can erase the source's database-owned provenance,
     /// inspect it only after SHOW COLUMNS authorization and reject an exact
     /// logical source. Worker-side local execution repeats the same fail-closed
-    /// inspection, closing a mapping race after this initiator snapshot.
+    /// inspection after a concurrent source change following this initiator snapshot.
     if (!create.cluster.empty() && stored_object_classification.object_kind == UDT::StoredObjectKind::Table
         && (stored_object_classification.source_mode == UDT::StoredObjectSourceMode::AsSourceTable
             || stored_object_classification.source_mode == UDT::StoredObjectSourceMode::CloneAsSourceTable
@@ -5003,15 +5551,8 @@ BlockIO InterpreterCreateQuery::execute()
         auto source_storage = DatabaseCatalog::instance().getTable({source_database_name, create.as_table}, getContext());
         [[maybe_unused]] auto source_structure_lock = source_storage->lockForShare(
             getContext()->getCurrentQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
-        auto source_metadata_handle = source_storage->IStorage::getInMemoryMetadataPtr(nullptr, true);
-        StorageMetadataPtr source_metadata = source_metadata_handle;
-        if (!source_metadata)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Native source table has no immutable metadata snapshot");
-        source_metadata->validateBoundUDTReferences();
-        if (source_metadata->getBoundUDTReferences())
-        {
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "A logical native Table source-sidecar cannot be copied by CREATE ON CLUSTER");
-        }
+        UDTPhysicalSchemaSourceGuard source_guard;
+        source_guard.captureNativePhysicalSchemaSource(source_storage, getContext());
     }
 
     bool is_create_database = create.database && !create.table;

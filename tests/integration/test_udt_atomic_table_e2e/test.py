@@ -280,6 +280,102 @@ def test_introspection_waits_for_live_alter_publication(started_cluster):
         q(f"DROP DATABASE IF EXISTS {database} SYNC")
 
 
+def test_physical_introspection_fast_path_closes_initial_mapping_gap(
+    started_cluster,
+):
+    suffix = uuid.uuid4().hex[:8]
+    database = f"udt_physical_introspection_race_{suffix}"
+    table = f"{database}.events"
+    alter_outcome = {"returned": False, "error": None}
+    alter_thread = None
+    prepared_failpoint_enabled = False
+    publication_failpoint_enabled = False
+
+    def alter_in_background():
+        try:
+            node.query(
+                f"ALTER TABLE {table} MODIFY COLUMN id {database}.AccountId",
+                settings=ENABLED,
+                timeout=60,
+            )
+            alter_outcome["returned"] = True
+        except BaseException as ex:  # noqa: BLE001 - surfaced in the main thread.
+            alter_outcome["error"] = ex
+
+    try:
+        q(f"CREATE DATABASE {database} ENGINE = Atomic")
+        q(f"CREATE TYPE {database}.AccountId AS UInt64")
+        q(f"CREATE TABLE {table} (id UInt64, note String) ENGINE = Memory")
+
+        node.query(f"SYSTEM ENABLE FAILPOINT {ALTER_PREPARED_FAILPOINT}")
+        prepared_failpoint_enabled = True
+        node.query(f"SYSTEM ENABLE FAILPOINT {ALTER_PUBLICATION_FAILPOINT}")
+        publication_failpoint_enabled = True
+        alter_thread = threading.Thread(target=alter_in_background, daemon=True)
+        alter_thread.start()
+
+        node.query(
+            f"SYSTEM WAIT FAILPOINT {ALTER_PREPARED_FAILPOINT} PAUSE",
+            timeout=30,
+        )
+        assert alter_thread.is_alive(), "ALTER returned before authority admission"
+
+        # The ALTER lock is held, but neither the live metadata nor the Atomic
+        # authority owns a mapping yet. Physical SHOW must not wait for ALTER.
+        started = time.monotonic()
+        physical_create = node.query(
+            f"SHOW CREATE TABLE {table}",
+            settings={**ENABLED, "lock_acquire_timeout": 1},
+            timeout=10,
+        )
+        elapsed = time.monotonic() - started
+        assert "`id` UInt64" in physical_create
+        assert f"{database}.AccountId" not in physical_create
+        assert elapsed < 8, elapsed
+
+        node.query(f"SYSTEM DISABLE FAILPOINT {ALTER_PREPARED_FAILPOINT}")
+        prepared_failpoint_enabled = False
+        node.query(
+            f"SYSTEM WAIT FAILPOINT {ALTER_PUBLICATION_FAILPOINT} PAUSE",
+            timeout=30,
+        )
+        assert alter_thread.is_alive(), "ALTER returned before live metadata publication"
+
+        # The durable authority now owns the table UUID while its live snapshot
+        # is still physical. The schema recheck must redirect SHOW to the ALTER
+        # lock instead of exposing either half of that split image.
+        query_error = node.query_and_get_error(
+            f"SHOW CREATE TABLE {table}",
+            settings={**ENABLED, "lock_acquire_timeout": 1},
+            timeout=10,
+        )
+        assert "DEADLOCK_AVOIDED" in query_error, query_error
+        assert "timed out" in query_error.lower(), query_error
+
+        node.query(f"SYSTEM DISABLE FAILPOINT {ALTER_PUBLICATION_FAILPOINT}")
+        publication_failpoint_enabled = False
+        alter_thread.join(timeout=30)
+        assert not alter_thread.is_alive(), "ALTER did not resume after disabling its failpoint"
+        if alter_outcome["error"] is not None:
+            raise alter_outcome["error"]
+        assert alter_outcome["returned"]
+        assert f"{database}.AccountId" in q(f"SHOW CREATE TABLE {table}")
+    finally:
+        if prepared_failpoint_enabled:
+            try:
+                node.query(f"SYSTEM DISABLE FAILPOINT {ALTER_PREPARED_FAILPOINT}")
+            except Exception:
+                pass
+        if publication_failpoint_enabled:
+            try:
+                node.query(f"SYSTEM DISABLE FAILPOINT {ALTER_PUBLICATION_FAILPOINT}")
+            except Exception:
+                pass
+        if alter_thread is not None:
+            alter_thread.join(timeout=30)
+        q(f"DROP DATABASE IF EXISTS {database} SYNC")
+
+
 def test_schema_inferred_table_function_create_is_fail_closed(started_cluster):
     suffix = uuid.uuid4().hex[:8]
     database = f"udt_table_function_guard_{suffix}"
@@ -336,18 +432,21 @@ def test_schema_inferred_table_function_create_is_fail_closed(started_cluster):
 
 def test_physicalization_apply_waits_for_prepared_alter(started_cluster):
     suffix = uuid.uuid4().hex[:8]
+    race_timeout = 300 if node.is_built_with_sanitizer() else 60
+    apply_query_id = f"udt_physicalize_apply_wait_{suffix}"
     database = f"udt_physicalize_alter_race_{suffix}"
     table = f"{database}.events"
     alter_outcome = {"returned": False, "error": None}
     alter_thread = None
     failpoint_enabled = False
+    apply_query_may_be_running = False
 
     def alter_in_background():
         try:
             node.query(
                 f"ALTER TABLE {table} MODIFY COLUMN id {database}.AccountId",
                 settings=ENABLED,
-                timeout=60,
+                timeout=race_timeout,
             )
             alter_outcome["returned"] = True
         except BaseException as ex:  # noqa: BLE001 - surfaced in the main thread.
@@ -366,7 +465,7 @@ def test_physicalization_apply_waits_for_prepared_alter(started_cluster):
         alter_thread.start()
         node.query(
             f"SYSTEM WAIT FAILPOINT {ALTER_PREPARED_FAILPOINT} PAUSE",
-            timeout=30,
+            timeout=race_timeout,
         )
         assert alter_thread.is_alive(), "ALTER returned before publishing its prepared package"
 
@@ -377,22 +476,23 @@ def test_physicalization_apply_waits_for_prepared_alter(started_cluster):
             "PHYSICALIZE TYPE REFERENCES APPLY TOKEN "
             + sql_string(plan["apply_token"])
         )
-        started = time.monotonic()
+        apply_query_may_be_running = True
         apply_error = node.query_and_get_error(
             apply_sql,
             settings={**ENABLED, "lock_acquire_timeout": 1},
-            timeout=10,
+            timeout=race_timeout,
+            query_id=apply_query_id,
         )
-        elapsed = time.monotonic() - started
+        apply_query_may_be_running = False
         assert "DEADLOCK_AVOIDED" in apply_error, apply_error
         assert "user-defined type physicalization" in apply_error.lower(), apply_error
         assert "timed out" in apply_error.lower(), apply_error
-        assert elapsed < 8, (elapsed, apply_error)
+        assert "(1000 ms)" in apply_error, apply_error
         assert alter_thread.is_alive(), "ALTER resumed while its failpoint was enabled"
 
         node.query(f"SYSTEM DISABLE FAILPOINT {ALTER_PREPARED_FAILPOINT}")
         failpoint_enabled = False
-        alter_thread.join(timeout=30)
+        alter_thread.join(timeout=race_timeout)
         assert not alter_thread.is_alive(), "ALTER did not resume after disabling its failpoint"
         if alter_outcome["error"] is not None:
             raise alter_outcome["error"]
@@ -402,13 +502,21 @@ def test_physicalization_apply_waits_for_prepared_alter(started_cluster):
         assert "anchored to an obsolete authority root" in stale.lower(), stale
         assert f"{database}.AccountId" in q(f"SHOW CREATE TABLE {table}")
     finally:
+        if apply_query_may_be_running:
+            try:
+                node.query(
+                    f"KILL QUERY WHERE query_id = {sql_string(apply_query_id)} SYNC",
+                    timeout=race_timeout,
+                )
+            except Exception:
+                pass
         if failpoint_enabled:
             try:
                 node.query(f"SYSTEM DISABLE FAILPOINT {ALTER_PREPARED_FAILPOINT}")
             except Exception:
                 pass
         if alter_thread is not None:
-            alter_thread.join(timeout=30)
+            alter_thread.join(timeout=race_timeout)
         q(f"DROP DATABASE IF EXISTS {database} SYNC")
 
 
