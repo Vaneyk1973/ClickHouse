@@ -12,6 +12,7 @@
 #include <Interpreters/addTypeConversionToAST.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTCreateHandlerQuery.h>
+#include <Parsers/ASTCreateTypeQuery.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTQueryParameter.h>
@@ -49,6 +50,11 @@ namespace ErrorCodes
 void ReplaceQueryParameterVisitor::visit(ASTPtr & ast)
 {
     checkStackSize();
+
+    /// A user-defined type rejects parameters in its persisted `CHECK` expressions.
+    if (ast->as<ASTCreateTypeQuery>())
+        return;
+
     resolveParameterizedAlias(ast);
 
     if (ast->as<ASTQueryParameter>())

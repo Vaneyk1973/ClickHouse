@@ -2,9 +2,9 @@
 
 #include <filesystem>
 #include <mutex>
-#include <optional>
 
-#include <base/types.h>
+#include <Interpreters/Context_fwd.h>
+#include <Parsers/IAST_fwd.h>
 
 
 namespace DB
@@ -18,9 +18,11 @@ class UserDefinedTypeCatalog
 public:
     explicit UserDefinedTypeCatalog(const String & data_path);
 
-    void create(const ASTCreateTypeQuery & query, bool fsync_metadata);
+    void create(const ASTCreateTypeQuery & query, const ContextPtr & context, bool fsync_metadata);
     void drop(const String & name, bool if_exists, bool fsync_metadata);
-    [[nodiscard]] std::optional<String> tryGetBaseType(const String & name) const;
+
+    /// Returns a freshly parsed `ASTCreateTypeQuery` or null if the name is absent.
+    [[nodiscard]] ASTPtr tryGetDefinition(const String & name) const;
 
 private:
     const std::filesystem::path directory;

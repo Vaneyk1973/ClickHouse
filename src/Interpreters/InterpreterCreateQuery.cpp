@@ -39,8 +39,10 @@
 #include <Parsers/ASTAsterisk.h>
 #include <Parsers/ASTCodecDeclaration.h>
 #include <Parsers/ASTColumnDeclaration.h>
+#include <Parsers/ASTConstraintDeclaration.h>
 #include <Parsers/ASTColumnsMatcher.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTCreateTypeQuery.h>
 #include <Parsers/ASTDataType.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -79,6 +81,7 @@
 #include <Interpreters/InterpreterFactory.h>
 #include <Interpreters/InterpreterCreateQuery.h>
 #include <Interpreters/UserDefinedTypeCatalog.h>
+#include <Interpreters/validateUserDefinedTypeCheck.h>
 #include <Interpreters/replaceLegacyToTime.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/InterpreterInsertQuery.h>
@@ -292,13 +295,14 @@ void normalizeLegacyToTimeInCreateQuery(ASTPtr & query, const ContextPtr & conte
     replaceLegacyToTime(*query);
 }
 
-void expandUserDefinedColumnTypes(ASTCreateQuery & create, const ContextPtr & context)
+bool expandUserDefinedColumnTypes(ASTCreateQuery & create, const ContextPtr & context)
 {
     if (!create.columns_list || !create.columns_list->columns || create.isView() || create.is_dictionary)
-        return;
+        return false;
 
     /// Repeated uses of a name in this schema must agree even during a concurrent `CREATE OR REPLACE TYPE`.
-    std::unordered_map<String, std::optional<String>> resolved_types;
+    std::unordered_map<String, ASTPtr> resolved_types;
+    NameSet constraint_names;
     const auto & factory = DataTypeFactory::instance();
     for (const auto & ast : create.columns_list->columns->children)
     {
@@ -310,20 +314,47 @@ void expandUserDefinedColumnTypes(ASTCreateQuery & create, const ContextPtr & co
 
         auto [it, inserted] = resolved_types.try_emplace(type->name);
         if (inserted)
-            it->second = context->getUserDefinedTypeCatalog().tryGetBaseType(type->name);
+            it->second = context->getUserDefinedTypeCatalog().tryGetDefinition(type->name);
         if (!it->second)
             continue;
 
         if (column.null_modifier.value_or(false))
             throw Exception(ErrorCodes::ILLEGAL_SYNTAX_FOR_DATA_TYPE, "Cannot use NULL with user-defined type {}", type->name);
 
-        const auto & base_name = *it->second;
-        column.setType(makeASTDataType(base_name));
+        const auto & definition = it->second->as<const ASTCreateTypeQuery &>();
+        column.setType(makeASTDataType(definition.base_type));
         column.null_modifier = false;
         /// The parser embeds the original type name in the implicit `EPHEMERAL` default.
         if (column.ephemeral_default)
-            column.setDefaultExpression(makeASTFunction("defaultValueOfTypeName", make_intrusive<ASTLiteral>(base_name)));
+            column.setDefaultExpression(makeASTFunction("defaultValueOfTypeName", make_intrusive<ASTLiteral>(definition.base_type)));
+
+        if (definition.checks().empty())
+            continue;
+
+        if (column.default_specifier == ColumnDefaultSpecifier::Alias || column.default_specifier == ColumnDefaultSpecifier::Ephemeral)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "A user-defined type with CHECK requires a physical column: {}", backQuote(column.name));
+
+        auto & columns = *create.columns_list;
+        if (!columns.constraints)
+            columns.set(columns.constraints, make_intrusive<ASTExpressionList>());
+        else if (constraint_names.empty())
+            for (const auto & constraint : columns.constraints->children)
+                constraint_names.insert(constraint->as<const ASTConstraintDeclaration &>().name);
+
+        size_t ordinal = 0;
+        for (const auto & check : definition.checks())
+        {
+            auto constraint = make_intrusive<ASTConstraintDeclaration>();
+            do
+            {
+                constraint->name = fmt::format("udt_{}_check_{}", column.name, ++ordinal);
+            } while (!constraint_names.insert(constraint->name).second);
+            constraint->type = ASTConstraintDeclaration::Type::CHECK;
+            constraint->set(constraint->expr, bindUserDefinedTypeCheck(*check, column.name));
+            columns.constraints->children.push_back(std::move(constraint));
+        }
     }
+    return !constraint_names.empty();
 }
 
 }
@@ -4212,8 +4243,22 @@ BlockIO InterpreterCreateQuery::execute()
     auto resolve_column_types = [this](IAST & ast)
     {
         auto & query = ast.as<ASTCreateQuery &>();
-        if (query.table && !query.attach && !is_restore_from_backup && !internal && !getContext()->isDDLOrOnClusterInternal())
-            expandUserDefinedColumnTypes(query, getContext());
+        if (!query.table || query.attach || is_restore_from_backup || internal || getContext()->isDDLOrOnClusterInternal())
+            return;
+        if (!expandUserDefinedColumnTypes(query, getContext()))
+            return;
+
+        /// Some engines discard constraints or forward inserts around their local constraint transform.
+        /// For queued DDL, pin the engine as well as the checks before sending the schema to workers.
+        if (!query.storage || !query.storage->engine)
+            setEngine(query);
+        if (query.as_table_function || !query.storage || !query.storage->engine)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot apply a user-defined type with CHECK to a table function");
+        const auto & engine = query.storage->engine->name;
+        getContext()->checkAccess(AccessType::TABLE_ENGINE, engine);
+        if (!engine.ends_with("MergeTree") && engine != "Memory" && engine != "Log"
+            && engine != "TinyLog" && engine != "StripeLog" && engine != "Null")
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Engine {} does not support user-defined types with CHECK", engine);
     };
 
     /// In Cloud, a user query can attach a detached table, but cannot create a table from a definition.

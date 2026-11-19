@@ -4,6 +4,7 @@
 #include <Parsers/ASTIdentifier_fwd.h>
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ExpressionElementParsers.h>
+#include <Parsers/ExpressionListParsers.h>
 
 namespace DB
 {
@@ -28,6 +29,17 @@ bool ParserCreateTypeQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     query->name = getIdentifierName(name);
     query->base_type = getIdentifierName(base_name);
     query->or_replace = or_replace;
+
+    ParserKeyword check_keyword(Keyword::CHECK);
+    ParserExpression expression_parser;
+    while (check_keyword.ignore(pos, expected))
+    {
+        ASTPtr check;
+        if (!expression_parser.parse(pos, check, expected))
+            return false;
+        query->children.push_back(std::move(check));
+    }
+
     node = std::move(query);
     return true;
 }

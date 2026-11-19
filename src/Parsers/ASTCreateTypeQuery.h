@@ -12,8 +12,10 @@ public:
     String base_type;
     bool or_replace = false;
 
+    const ASTs & checks() const { return children; }
+
     String getID(char delim) const override { return "CreateTypeQuery" + (delim + name); }
-    ASTPtr clone() const override { return make_intrusive<ASTCreateTypeQuery>(*this); }
+    ASTPtr clone() const override;
     QueryKind getQueryKind() const override { return QueryKind::Create; }
     void updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const override;
 

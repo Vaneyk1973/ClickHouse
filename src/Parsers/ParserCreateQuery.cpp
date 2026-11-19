@@ -2163,13 +2163,17 @@ Comments can be added for columns and for the table.
 `CREATE TYPE` gives a name to an `Int64`, `UInt64`, or `String` column declaration. The name is available across databases on the server.
 
 ```sql
-CREATE TYPE CustomerId AS UInt64;
+CREATE TYPE CustomerId AS UInt64 CHECK VALUE > 0;
 CREATE TABLE orders (customer CustomerId) ENGINE = MergeTree ORDER BY customer;
 DROP TYPE CustomerId;
-DESCRIBE TABLE orders; -- customer is still UInt64
+SHOW CREATE TABLE orders; -- customer is UInt64 with a CHECK on customer > 0
 ```
 
-`CREATE TABLE` resolves the name when it creates the column. `SHOW CREATE TABLE` contains the base type, so the table can be recreated independently. `CREATE OR REPLACE TYPE` changes the definition used by subsequent table declarations.
+`CREATE TABLE` copies the base type and each optional `CHECK` into the table definition. In the type declaration, `VALUE` denotes the value of the column after conversion to the base type. You can supply several `CHECK` clauses. Each one becomes a named table constraint that is enforced on insert, including on default values. `SHOW CREATE TABLE` returns SQL that can recreate the checks independently of the type definition. `CREATE OR REPLACE TYPE` changes the definition used by subsequent table declarations.
+
+Check expressions support literals, arithmetic, comparisons, Boolean and conditional expressions, and selected deterministic built-in scalar functions such as `abs`, `length`, `notEmpty`, `startsWith` and `match`. Other columns, subqueries, user-defined functions and functions that read external data or depend on the time or random input are rejected when the type is declared.
+
+Checked declarations apply to physical columns in the `MergeTree` family, `Memory`, `Log`, `TinyLog`, `StripeLog` and `Null`. Use an ordinary table `CHECK` directly when you need to refer to several columns.
 
 Use the name as the entire type of a non-nullable column. In expressions, nested types, and `ALTER TABLE`, use the base type. Creating and dropping definitions require the `CREATE TYPE` and `DROP TYPE` privileges respectively. Replacing a definition requires both privileges.
 

@@ -35,7 +35,7 @@ public:
             if (create->or_replace)
                 context_ptr->checkAccess(AccessType::DROP_TYPE);
 
-            context_ptr->getUserDefinedTypeCatalog().create(*create, context_ptr->getSettingsRef()[Setting::fsync_metadata]);
+            context_ptr->getUserDefinedTypeCatalog().create(*create, context_ptr, context_ptr->getSettingsRef()[Setting::fsync_metadata]);
         }
         else
         {

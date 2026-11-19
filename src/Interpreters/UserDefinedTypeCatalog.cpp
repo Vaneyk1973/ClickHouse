@@ -1,6 +1,7 @@
 #include <Interpreters/UserDefinedTypeCatalog.h>
 
 #include <algorithm>
+#include <optional>
 
 #include <Common/Exception.h>
 #include <Common/SipHash.h>
@@ -15,6 +16,7 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteHelpers.h>
+#include <Interpreters/validateUserDefinedTypeCheck.h>
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTCreateTypeQuery.h>
 #include <Parsers/ASTDataType.h>
@@ -38,13 +40,12 @@ namespace ErrorCodes
 namespace
 {
 
-const String & getBaseTypeName(const ASTCreateTypeQuery & query)
+void validateBaseType(const ASTCreateTypeQuery & query)
 {
     const auto & base_type = query.base_type;
     if (base_type != "Int64" && base_type != "UInt64" && base_type != "String")
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS, "User-defined type {} must have base type Int64, UInt64, or String", backQuote(query.name));
-    return base_type;
 }
 
 bool canUseAsColumnType(const String & name)
@@ -128,10 +129,11 @@ UserDefinedTypeCatalog::UserDefinedTypeCatalog(const String & data_path)
 {
 }
 
-void UserDefinedTypeCatalog::create(const ASTCreateTypeQuery & query, bool fsync_metadata)
+void UserDefinedTypeCatalog::create(const ASTCreateTypeQuery & query, const ContextPtr & context, bool fsync_metadata)
 {
     validateName(query.name);
-    getBaseTypeName(query);
+    validateBaseType(query);
+    validateUserDefinedTypeChecks(query, context);
 
     auto normalized = query;
     normalized.or_replace = false;
@@ -201,13 +203,13 @@ void UserDefinedTypeCatalog::drop(const String & name, bool if_exists, bool fsyn
         syncCatalogAfterChange(*directory_sync, name, "is absent");
 }
 
-std::optional<String> UserDefinedTypeCatalog::tryGetBaseType(const String & name) const
+ASTPtr UserDefinedTypeCatalog::tryGetDefinition(const String & name) const
 {
     std::lock_guard lock(mutex);
     auto file = findDefinition(directory, name);
-    if (!file.query)
-        return std::nullopt;
-    return getBaseTypeName(file.query->as<const ASTCreateTypeQuery &>());
+    if (file.query)
+        validateBaseType(file.query->as<const ASTCreateTypeQuery &>());
+    return std::move(file.query);
 }
 
 }
