@@ -47,6 +47,9 @@ struct DDLQueryOnClusterParams
     /// their own objects.
     std::function<void(const String & default_database, bool throw_if_unresolved)> additional_access_check;
 
+    /// Resolve server-local names in the query sent to workers after checking the initiator's privileges.
+    std::function<void(IAST &)> normalize_query;
+
     /// Use retries when creating nodes "query-0000000000", "query-0000000001", "query-0000000002" in ZooKeeper.
     ZooKeeperRetriesInfo retries_info;
 };

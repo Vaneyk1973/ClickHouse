@@ -1,6 +1,8 @@
 #pragma once
 #include "config.h"
 
+#include <functional>
+
 #include <Core/NamesAndAliases.h>
 #include <Core/QualifiedTableName.h>
 #include <Access/Common/AccessRightsElement.h>
@@ -211,7 +213,7 @@ private:
     /// It's used to prevent automatic schema inference while table creation on each server startup.
     void addColumnsDescriptionToCreateQueryIfNecessary(ASTCreateQuery & create, const StoragePtr & storage);
 
-    BlockIO executeQueryOnCluster(ASTCreateQuery & create);
+    BlockIO executeQueryOnCluster(ASTCreateQuery & create, std::function<void(IAST &)> normalize_query = {});
 
     void convertMergeTreeTableIfPossible(ASTCreateQuery & create, DatabasePtr database, bool to_replicated);
 

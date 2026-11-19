@@ -41,6 +41,7 @@
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTColumnsMatcher.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTDataType.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
@@ -77,6 +78,7 @@
 #include <Interpreters/DDLTask.h>
 #include <Interpreters/InterpreterFactory.h>
 #include <Interpreters/InterpreterCreateQuery.h>
+#include <Interpreters/UserDefinedTypeCatalog.h>
 #include <Interpreters/replaceLegacyToTime.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/InterpreterInsertQuery.h>
@@ -288,6 +290,40 @@ void normalizeLegacyToTimeInCreateQuery(ASTPtr & query, const ContextPtr & conte
     if (!UserDefinedSQLFunctionFactory::instance().empty())
         substituteUserDefinedFunctionsOutsideEngines(query, context);
     replaceLegacyToTime(*query);
+}
+
+void expandUserDefinedColumnTypes(ASTCreateQuery & create, const ContextPtr & context)
+{
+    if (!create.columns_list || !create.columns_list->columns || create.isView() || create.is_dictionary)
+        return;
+
+    /// Repeated uses of a name in this schema must agree even during a concurrent `CREATE OR REPLACE TYPE`.
+    std::unordered_map<String, std::optional<String>> resolved_types;
+    const auto & factory = DataTypeFactory::instance();
+    for (const auto & ast : create.columns_list->columns->children)
+    {
+        auto & column = ast->as<ASTColumnDeclaration &>();
+        auto type_ast = column.getType();
+        const auto * type = type_ast ? type_ast->as<ASTDataType>() : nullptr;
+        if (!type || type->getArguments() || factory.hasNameOrAlias(type->name) || factory.isCaseInsensitive(type->name))
+            continue;
+
+        auto [it, inserted] = resolved_types.try_emplace(type->name);
+        if (inserted)
+            it->second = context->getUserDefinedTypeCatalog().tryGetBaseType(type->name);
+        if (!it->second)
+            continue;
+
+        if (column.null_modifier.value_or(false))
+            throw Exception(ErrorCodes::ILLEGAL_SYNTAX_FOR_DATA_TYPE, "Cannot use NULL with user-defined type {}", type->name);
+
+        const auto & base_name = *it->second;
+        column.setType(makeASTDataType(base_name));
+        column.null_modifier = false;
+        /// The parser embeds the original type name in the implicit `EPHEMERAL` default.
+        if (column.ephemeral_default)
+            column.setDefaultExpression(makeASTFunction("defaultValueOfTypeName", make_intrusive<ASTLiteral>(base_name)));
+    }
 }
 
 }
@@ -4141,11 +4177,12 @@ void InterpreterCreateQuery::prepareOnClusterQuery(ASTCreateQuery & create, Cont
     }
 }
 
-BlockIO InterpreterCreateQuery::executeQueryOnCluster(ASTCreateQuery & create)
+BlockIO InterpreterCreateQuery::executeQueryOnCluster(ASTCreateQuery & create, std::function<void(IAST &)> normalize_query)
 {
     prepareOnClusterQuery(create, getContext(), create.cluster);
     DDLQueryOnClusterParams params;
     params.access_to_check = getRequiredAccess();
+    params.normalize_query = std::move(normalize_query);
     params.additional_access_check = [captured_query_ptr = query_ptr](const String &, bool throw_if_unresolved)
     {
         /// `throw_if_unresolved` means the hosts do not run the query as this user.
@@ -4171,6 +4208,13 @@ BlockIO InterpreterCreateQuery::execute()
     create.if_not_exists |= getContext()->getSettingsRef()[Setting::create_if_not_exists];
 
     bool is_create_database = create.database && !create.table;
+
+    auto resolve_column_types = [this](IAST & ast)
+    {
+        auto & query = ast.as<ASTCreateQuery &>();
+        if (query.table && !query.attach && !is_restore_from_backup && !internal && !getContext()->isDDLOrOnClusterInternal())
+            expandUserDefinedColumnTypes(query, getContext());
+    };
 
     /// In Cloud, a user query can attach a detached table, but cannot create a table from a definition.
     /// Checked here because ON CLUSTER can send the query to other hosts before `createTable` runs.
@@ -4301,7 +4345,9 @@ BlockIO InterpreterCreateQuery::execute()
                 normalizeLegacyToTimeInCreateQuery(query_ptr, getContext());
             }
 
-            return executeQueryOnCluster(create);
+            /// Older entry formats skip ordinary schema normalization. Resolve type names on the
+            /// initiator once `executeDDLQueryOnCluster` has authorized all target databases.
+            return executeQueryOnCluster(create, resolve_column_types);
         }
     }
 
@@ -4312,6 +4358,7 @@ BlockIO InterpreterCreateQuery::execute()
     /// CREATE|ATTACH DATABASE
     if (is_create_database)
         return createDatabase(create);
+    resolve_column_types(create);
     return createTable(create);
 }
 

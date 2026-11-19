@@ -2,11 +2,13 @@
 #include <Parsers/ParserCreateFunctionQuery.h>
 #include <Parsers/ParserCreateWorkloadQuery.h>
 #include <Parsers/ParserCreateResourceQuery.h>
+#include <Parsers/ParserCreateTypeQuery.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/ParserCreateIndexQuery.h>
 #include <Parsers/ParserDropFunctionQuery.h>
 #include <Parsers/ParserDropWorkloadQuery.h>
 #include <Parsers/ParserDropResourceQuery.h>
+#include <Parsers/ParserDropTypeQuery.h>
 #include <Parsers/ParserDropIndexQuery.h>
 #include <Parsers/ParserDropNamedCollectionQuery.h>
 #include <Parsers/ParserAlterNamedCollectionQuery.h>
@@ -116,6 +118,8 @@ bool ParserQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserDropWorkloadQuery drop_workload_p;
     ParserCreateResourceQuery create_resource_p;
     ParserDropResourceQuery drop_resource_p;
+    ParserCreateTypeQuery create_type_p;
+    ParserDropTypeQuery drop_type_p;
     ParserCreateNamedCollectionQuery create_named_collection_p;
     ParserDropNamedCollectionQuery drop_named_collection_p;
     ParserAlterNamedCollectionQuery alter_named_collection_p;
@@ -142,6 +146,8 @@ bool ParserQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         || drop_workload_p.parse(pos, node, expected)
         || create_resource_p.parse(pos, node, expected)
         || drop_resource_p.parse(pos, node, expected)
+        || create_type_p.parse(pos, node, expected)
+        || drop_type_p.parse(pos, node, expected)
         || create_named_collection_p.parse(pos, node, expected)
         || drop_named_collection_p.parse(pos, node, expected)
         || alter_named_collection_p.parse(pos, node, expected)

@@ -2158,6 +2158,21 @@ If necessary, primary key can be specified, with one or more key expressions.
 
 Comments can be added for columns and for the table.
 
+#### Use a named column type {#named-column-type}
+
+`CREATE TYPE` gives a name to an `Int64`, `UInt64`, or `String` column declaration. The name is available across databases on the server.
+
+```sql
+CREATE TYPE CustomerId AS UInt64;
+CREATE TABLE orders (customer CustomerId) ENGINE = MergeTree ORDER BY customer;
+DROP TYPE CustomerId;
+DESCRIBE TABLE orders; -- customer is still UInt64
+```
+
+`CREATE TABLE` resolves the name when it creates the column. `SHOW CREATE TABLE` contains the base type, so the table can be recreated independently. `CREATE OR REPLACE TYPE` changes the definition used by subsequent table declarations.
+
+Use the name as the entire type of a non-nullable column. In expressions, nested types, and `ALTER TABLE`, use the base type. Creating and dropping definitions require the `CREATE TYPE` and `DROP TYPE` privileges respectively. Replacing a definition requires both privileges.
+
 ### Create a table with an existing tables schema {#with-a-schema-similar-to-other-table}
 
 ```sql

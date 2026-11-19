@@ -54,6 +54,7 @@ void registerInterpreterCreateWorkloadQuery(InterpreterFactory & factory);
 void registerInterpreterDropWorkloadQuery(InterpreterFactory & factory);
 void registerInterpreterCreateResourceQuery(InterpreterFactory & factory);
 void registerInterpreterDropResourceQuery(InterpreterFactory & factory);
+void registerInterpreterTypeQuery(InterpreterFactory & factory);
 void registerInterpreterCreateIndexQuery(InterpreterFactory & factory);
 void registerInterpreterCreateNamedCollectionQuery(InterpreterFactory & factory);
 void registerInterpreterCreateHandlerQuery(InterpreterFactory & factory);
@@ -122,6 +123,7 @@ void registerInterpreters()
     registerInterpreterDropWorkloadQuery(factory);
     registerInterpreterCreateResourceQuery(factory);
     registerInterpreterDropResourceQuery(factory);
+    registerInterpreterTypeQuery(factory);
     registerInterpreterCreateIndexQuery(factory);
     registerInterpreterCreateNamedCollectionQuery(factory);
     registerInterpreterCreateHandlerQuery(factory);

@@ -138,6 +138,7 @@
 #include <Interpreters/SessionQueryIdsHistory.h>
 #include <Interpreters/Session.h>
 #include <Interpreters/TraceCollector.h>
+#include <Interpreters/UserDefinedTypeCatalog.h>
 #include <IO/AsyncReadCounters.h>
 #include <IO/UncompressedCache.h>
 #include <Storages/MergeTree/ColumnsCache.h>
@@ -730,6 +731,9 @@ struct ContextSharedPart : boost::noncopyable
 
     mutable OnceFlag user_defined_sql_objects_storage_initialized;
     mutable std::unique_ptr<IUserDefinedSQLObjectsStorage> user_defined_sql_objects_storage;
+
+    mutable OnceFlag user_defined_type_catalog_initialized;
+    mutable std::unique_ptr<UserDefinedTypeCatalog> user_defined_type_catalog;
 
     mutable OnceFlag workload_entity_storage_initialized;
     mutable std::shared_ptr<IWorkloadEntityStorage> workload_entity_storage;
@@ -5103,6 +5107,15 @@ IUserDefinedSQLObjectsStorage & Context::getUserDefinedSQLObjectsStorage()
     });
 
     return *shared->user_defined_sql_objects_storage;
+}
+
+UserDefinedTypeCatalog & Context::getUserDefinedTypeCatalog() const
+{
+    callOnce(shared->user_defined_type_catalog_initialized, [&] {
+        shared->user_defined_type_catalog = std::make_unique<UserDefinedTypeCatalog>(getPath());
+    });
+
+    return *shared->user_defined_type_catalog;
 }
 
 std::shared_ptr<IWorkloadEntityStorage> Context::getWorkloadEntityStoragePtr() const

@@ -435,6 +435,7 @@ The hierarchy of privileges in ClickHouse is shown below:
     - `CREATE TABLE`
     - `CREATE VIEW`
   - `CREATE RESOURCE`
+  - `CREATE TYPE`
   - `CREATE WORKLOAD`
   - [`dictGet`](#dictget)
   - [`displaySecretsInShowAndSelect`](#displaysecretsinshowandselect)
@@ -445,6 +446,7 @@ The hierarchy of privileges in ClickHouse is shown below:
     - `DROP TABLE`
     - `DROP VIEW`
   - `DROP RESOURCE`
+  - `DROP TYPE`
   - `DROP WORKLOAD`
   - `HANDLER ADMIN`
     - `ALTER HANDLER`

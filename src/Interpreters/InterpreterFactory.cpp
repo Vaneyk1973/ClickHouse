@@ -5,6 +5,7 @@
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTCreateWorkloadQuery.h>
 #include <Parsers/ASTCreateResourceQuery.h>
+#include <Parsers/ASTCreateTypeQuery.h>
 #include <Parsers/ASTCreateFunctionWithDriverQuery.h>
 #include <Parsers/ASTCreateSQLFunctionQuery.h>
 #include <Parsers/ASTCreateWasmFunctionQuery.h>
@@ -13,6 +14,7 @@
 #include <Parsers/ASTDropFunctionQuery.h>
 #include <Parsers/ASTDropWorkloadQuery.h>
 #include <Parsers/ASTDropResourceQuery.h>
+#include <Parsers/ASTDropTypeQuery.h>
 #include <Parsers/ASTDropIndexQuery.h>
 #include <Parsers/ASTDropQuery.h>
 #include <Parsers/ASTUndropQuery.h>
@@ -354,6 +356,10 @@ InterpreterFactory::InterpreterPtr InterpreterFactory::get(ASTPtr & query, Conte
     else if (query->as<ASTDropResourceQuery>())
     {
         interpreter_name = "InterpreterDropResourceQuery";
+    }
+    else if (query->as<ASTCreateTypeQuery>() || query->as<ASTDropTypeQuery>())
+    {
+        interpreter_name = "InterpreterTypeQuery";
     }
     else if (query->as<ASTCreateIndexQuery>())
     {

@@ -253,6 +253,7 @@ enum class AccessType : uint16_t
     M(CREATE_TEMPORARY_VIEW, "", GLOBAL, CREATE) /* allows to create and manipulate temporary tables;
                                                      implicitly enabled by the grant CREATE_VIEW on any table */ \
     M(CREATE_FUNCTION, "", GLOBAL, CREATE) /* allows to execute CREATE FUNCTION */ \
+    M(CREATE_TYPE, "", GLOBAL, ALL) /* allows to execute CREATE TYPE */ \
     M(CREATE_WORKLOAD, "", GLOBAL, ALL) /* allows to execute CREATE WORKLOAD */ \
     M(CREATE_RESOURCE, "", GLOBAL, ALL) /* allows to execute CREATE RESOURCE */ \
     M(CREATE_NAMED_COLLECTION, "", NAMED_COLLECTION, NAMED_COLLECTION_ADMIN) /* allows to execute CREATE NAMED COLLECTION */ \
@@ -265,6 +266,7 @@ enum class AccessType : uint16_t
                                     implicitly enabled by the grant DROP_TABLE */\
     M(DROP_DICTIONARY, "", DICTIONARY, DROP) /* allows to execute {DROP|DETACH} DICTIONARY */\
     M(DROP_FUNCTION, "", GLOBAL, DROP) /* allows to execute DROP FUNCTION */\
+    M(DROP_TYPE, "", GLOBAL, ALL) /* allows to execute DROP TYPE */\
     M(DROP_WORKLOAD, "", GLOBAL, ALL) /* allows to execute DROP WORKLOAD */\
     M(DROP_RESOURCE, "", GLOBAL, ALL) /* allows to execute DROP RESOURCE */\
     M(DROP_NAMED_COLLECTION, "", NAMED_COLLECTION, NAMED_COLLECTION_ADMIN) /* allows to execute DROP NAMED COLLECTION */\

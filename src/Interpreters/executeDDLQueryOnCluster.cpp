@@ -206,6 +206,8 @@ BlockIO executeDDLQueryOnCluster(const ASTPtr & query_ptr_, ContextPtr context, 
 
     /// Check access rights, assume that all servers have the same users config
     context->checkAccess(access_to_check);
+    if (params.normalize_query)
+        params.normalize_query(*query_ptr);
 
     DDLLogEntry entry;
     entry.hosts = std::move(hosts);
