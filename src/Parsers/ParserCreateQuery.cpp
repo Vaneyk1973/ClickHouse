@@ -2177,7 +2177,7 @@ Checked declarations apply to physical columns in the `MergeTree` family, `Memor
 
 When a physical column name matches the computed name of a generated check (for example, `greater(x, 0)` for `CHECK x > 0`), choose a different column name. The table declaration reports the conflict before creating the table.
 
-When exporting a literal column name that resembles a JSON path component, such as `` :`city` ``, the destination must preserve the quoting in its own metadata. ClickHouse 26.10.6.18 accepts the exported SQL but loses those quotes when it stores the check, so it cannot reopen that table.
+To transfer a checked column with a literal name such as `` :`city` ``, use a destination that preserves quotes around standalone identifiers in native `CHECK` metadata. With this formatter fix, the destination can reopen the exported table using the base type and native constraint alone. ClickHouse 26.10.6.18 loses these quotes even for a hand-written `CHECK` and cannot reopen the table.
 
 Use the name as the entire type of a non-nullable column. In expressions, nested types, and `ALTER TABLE`, use the base type. Creating and dropping definitions require the `CREATE TYPE` and `DROP TYPE` privileges respectively. Replacing a definition requires both privileges.
 

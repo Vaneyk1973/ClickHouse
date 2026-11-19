@@ -76,11 +76,13 @@ ${CLICKHOUSE_LOCAL} --path "${work_dir}/source" --multiquery <<'SQL'
 SQL
 
 ddl=$(${CLICKHOUSE_LOCAL} --path "${work_dir}/source" --database checked --query 'SHOW CREATE TABLE quoted_city FORMAT TSVRaw')
-{
-    printf 'SET async_insert = 0; CREATE DATABASE checked ENGINE = Atomic; USE checked;\n%s;\n' "$ddl"
-    cat <<'SQL'
+printf 'CREATE DATABASE checked ENGINE = Atomic; USE checked;\n%s;\n' "$ddl" \
+    | ${CLICKHOUSE_LOCAL} --path "${work_dir}/target" --multiquery
+
+# Reopen the recipient's own metadata before checking the imported constraint.
+${CLICKHOUSE_LOCAL} --path "${work_dir}/target" --database checked --multiquery <<'SQL'
+    SET async_insert = 0;
     INSERT INTO quoted_city VALUES (1, 'Lisbon', '{"city":"Oslo"}');
     INSERT INTO quoted_city VALUES (2, 'Oslo', '{"city":"Lisbon"}'); -- { serverError VIOLATED_CONSTRAINT }
     SELECT ":`city`", details.city.:String FROM quoted_city;
 SQL
-} | ${CLICKHOUSE_LOCAL} --path "${work_dir}/target" --multiquery
