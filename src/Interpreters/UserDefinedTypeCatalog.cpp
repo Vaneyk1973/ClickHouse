@@ -3,18 +3,23 @@
 #include <algorithm>
 
 #include <Common/Exception.h>
+#include <Common/SipHash.h>
 #include <Common/StringUtils.h>
 #include <Common/atomicRename.h>
 #include <Common/escapeForFileName.h>
+#include <Common/filesystemHelpers.h>
 #include <Common/quoteString.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <Disks/LocalDirectorySyncGuard.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteHelpers.h>
+#include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTCreateTypeQuery.h>
+#include <Parsers/ASTDataType.h>
+#include <Parsers/ParserCreateQuery.h>
 #include <Parsers/ParserCreateTypeQuery.h>
-#include <Parsers/ParserDataType.h>
 #include <Parsers/parseQuery.h>
 
 
@@ -42,19 +47,65 @@ const String & getBaseTypeName(const ASTCreateTypeQuery & query)
     return base_type;
 }
 
+bool canUseAsColumnType(const String & name)
+{
+    /// `ASTDataType` prints the name unquoted. A leading dollar tag can consume later tokens as a heredoc.
+    if (!std::ranges::all_of(name, [](char c) { return isWordCharASCII(c) || c == '$'; })
+        || (name.starts_with('$') && name.find('$', 1) != String::npos))
+        return false;
+
+    const String declaration = "x " + name;
+    const char * begin = declaration.data();
+    String parse_error;
+    ParserColumnDeclaration parser{true, true};
+    auto ast = tryParseQuery(parser, begin, declaration.data() + declaration.size(), parse_error, false, "column declaration", false, 0, 0, 0, true);
+    auto type = ast ? ast->as<ASTColumnDeclaration &>().getType() : nullptr;
+    const auto * data_type = type ? type->as<ASTDataType>() : nullptr;
+    return data_type && data_type->name == name;
+}
+
 void validateName(const String & name)
 {
-    /// The name must also work where it is used, after a column name.
-    const auto quoted_name = backQuote(name);
-    const char * begin = quoted_name.data();
-    String parse_error;
-    ParserDataType parser;
-    if (!tryParseQuery(parser, begin, quoted_name.data() + quoted_name.size(), parse_error, false, "data type name", false, 0, 0, 0, true))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid user-defined type name {}", quoted_name);
+    if (!canUseAsColumnType(name))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid user-defined type name {}", backQuote(name));
 
     const auto builtin_names = DataTypeFactory::instance().getAllRegisteredNames();
     if (std::ranges::any_of(builtin_names, [&](const auto & builtin) { return equalsCaseInsensitive(builtin, name); }))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "User-defined type {} conflicts with a built-in type or alias", quoted_name);
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "User-defined type {} conflicts with a built-in type or alias", backQuote(name));
+}
+
+struct DefinitionFile
+{
+    fs::path path;
+    ASTPtr query;
+};
+
+DefinitionFile findDefinition(const fs::path & directory, const String & name)
+{
+    /// A lowercase hash distinguishes SQL names even on a case-insensitive filesystem. The hyphen cannot occur in a legacy stem.
+    const auto new_path = directory / ("type-" + sipHash128String(name) + ".sql");
+    const bool legacy = !fs::exists(new_path);
+    const auto path = legacy ? directory / (escapeForFileName(name) + ".sql") : new_path;
+    if (legacy && !existsOrFileNameTooLong([&] { return fs::exists(path); }))
+        return {new_path, {}};
+
+    ReadBufferFromFile in(path.string());
+    String statement;
+    readStringUntilEOF(statement, in);
+    ParserCreateTypeQuery parser;
+    auto ast = parseQuery(parser, statement, "in file " + path.string(), 0, 0, 0);
+    const auto & stored_name = ast->as<const ASTCreateTypeQuery &>().name;
+    if (stored_name == name)
+        return {path, std::move(ast)};
+
+    /// An old file can be reached by another spelling. Leave it with its original owner, including on replace and drop.
+    if (legacy && equalsCaseInsensitive(name, stored_name))
+    {
+        const auto stored_path = directory / (escapeForFileName(stored_name) + ".sql");
+        if (fs::exists(stored_path) && fs::equivalent(stored_path, path))
+            return {new_path, {}};
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "Type name {} does not match its metadata file {}", backQuote(stored_name), path.string());
 }
 
 }
@@ -62,11 +113,6 @@ void validateName(const String & name)
 UserDefinedTypeCatalog::UserDefinedTypeCatalog(const String & data_path)
     : directory(fs::path(data_path) / "user_defined_types")
 {
-}
-
-fs::path UserDefinedTypeCatalog::getFilePath(const String & name) const
-{
-    return directory / (escapeForFileName(name) + ".sql");
 }
 
 void UserDefinedTypeCatalog::create(const ASTCreateTypeQuery & query, bool fsync_metadata)
@@ -77,14 +123,23 @@ void UserDefinedTypeCatalog::create(const ASTCreateTypeQuery & query, bool fsync
     auto normalized = query;
     normalized.or_replace = false;
     const auto create_statement = normalized.formatWithSecretsOneLine();
-    const auto file_path = getFilePath(query.name);
-    const auto temporary_path = file_path.string() + ".tmp";
-
     std::lock_guard lock(mutex);
-    if (!query.or_replace && fs::exists(file_path))
+    const auto [file_path, existing_query] = findDefinition(directory, query.name);
+    if (!query.or_replace && existing_query)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "User-defined type {} already exists", backQuote(query.name));
 
-    fs::create_directories(directory);
+    /// The first create may have had `fsync_metadata` disabled. Sync the directory entry on the first durable write.
+    std::optional<LocalDirectorySyncGuard> parent_sync;
+    if (fsync_metadata && !directory_entry_synced)
+        parent_sync.emplace(directory.parent_path().string());
+    fs::create_directory(directory);
+    if (parent_sync)
+    {
+        parent_sync->sync();
+        directory_entry_synced = true;
+    }
+
+    const auto temporary_path = file_path.string() + ".tmp";
     try
     {
         WriteBufferFromFile out(temporary_path, create_statement.size() + 1);
@@ -94,10 +149,15 @@ void UserDefinedTypeCatalog::create(const ASTCreateTypeQuery & query, bool fsync
             out.sync();
         out.close();
 
+        std::optional<LocalDirectorySyncGuard> directory_sync;
+        if (fsync_metadata)
+            directory_sync.emplace(directory.string());
         if (query.or_replace)
             fs::rename(temporary_path, file_path);
         else
             renameNoReplace(temporary_path, file_path.string());
+        if (directory_sync)
+            directory_sync->sync();
     }
     catch (...)
     {
@@ -107,33 +167,34 @@ void UserDefinedTypeCatalog::create(const ASTCreateTypeQuery & query, bool fsync
     }
 }
 
-void UserDefinedTypeCatalog::drop(const String & name, bool if_exists)
+void UserDefinedTypeCatalog::drop(const String & name, bool if_exists, bool fsync_metadata)
 {
     std::lock_guard lock(mutex);
-    if (!fs::remove(getFilePath(name)) && !if_exists)
+    const auto [path, query] = findDefinition(directory, name);
+    if (!query)
+    {
+        if (!if_exists)
+            throw Exception(ErrorCodes::UNKNOWN_TYPE, "User-defined type {} doesn't exist", backQuote(name));
+        /// A previous drop may have unlinked the file and then failed to sync the directory.
+        if (!fsync_metadata || !fs::exists(directory))
+            return;
+    }
+    std::optional<LocalDirectorySyncGuard> directory_sync;
+    if (fsync_metadata)
+        directory_sync.emplace(directory.string());
+    if (query && !fs::remove(path) && !if_exists)
         throw Exception(ErrorCodes::UNKNOWN_TYPE, "User-defined type {} doesn't exist", backQuote(name));
+    if (directory_sync)
+        directory_sync->sync();
 }
 
 std::optional<String> UserDefinedTypeCatalog::tryGetBaseType(const String & name) const
 {
-    const auto file_path = getFilePath(name);
-    String create_statement;
-    {
-        std::lock_guard lock(mutex);
-        if (!fs::exists(file_path))
-            return std::nullopt;
-
-        ReadBufferFromFile in(file_path.string());
-        readStringUntilEOF(create_statement, in);
-    }
-
-    ParserCreateTypeQuery parser;
-    auto ast = parseQuery(parser, create_statement, "in file " + file_path.string(), 0, 0, 0);
-    const auto & query = ast->as<const ASTCreateTypeQuery &>();
-    if (query.name != name)
-        throw Exception(
-            ErrorCodes::CORRUPTED_DATA, "Type name {} does not match its metadata file {}", backQuote(query.name), file_path.string());
-    return getBaseTypeName(query);
+    std::lock_guard lock(mutex);
+    auto file = findDefinition(directory, name);
+    if (!file.query)
+        return std::nullopt;
+    return getBaseTypeName(file.query->as<const ASTCreateTypeQuery &>());
 }
 
 }

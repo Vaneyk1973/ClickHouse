@@ -5,4 +5,9 @@ Int64	-8
 Int64	3
 String	replacement
 UInt64	18446744073709551615
-UInt64
+upper_value	Int64
+lower_value	UInt64
+dollar_value	String
+variant_value	String
+legacy_value	UInt64
+legacy_variant_value	Int64

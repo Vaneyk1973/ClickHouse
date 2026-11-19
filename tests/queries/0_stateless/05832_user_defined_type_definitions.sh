@@ -108,8 +108,45 @@ ${CLICKHOUSE_CLIENT} --multiquery --query "
     SELECT toTypeName(value), value FROM recreated;
 "
 
-${CLICKHOUSE_LOCAL} --path "${local_dir}" --query "CREATE TYPE persisted_lite_type AS UInt64"
-${CLICKHOUSE_LOCAL} --path "${local_dir}" --query "
-    CREATE TABLE after_restart (value persisted_lite_type) ENGINE = Memory;
-    SELECT type FROM system.columns WHERE database = currentDatabase() AND table = 'after_restart';
-"
+${CLICKHOUSE_LOCAL} --path "${local_dir}" --multiquery <<'SQL'
+    CREATE TYPE CaseLite AS Int64;
+    CREATE TYPE caselite AS UInt64;
+    CREATE TYPE `persisted$lite_type` AS String;
+SQL
+
+metadata_dir="${local_dir}/user_defined_types"
+# The filenames must also be distinct on a case-insensitive filesystem.
+metadata_files=("${metadata_dir}"/*)
+test "${#metadata_files[@]}" -eq 3
+test "$(printf '%s\n' "${metadata_files[@]}" | LC_ALL=C sort -fu | wc -l)" -eq 3
+
+# The original catalog used the escaped SQL name directly as the file stem.
+printf '%s\n' 'CREATE TYPE LegacyLite AS UInt64' > "${metadata_dir}/LegacyLite.sql"
+printf '%s\n' 'CREATE TYPE `$` AS UInt64' > "${metadata_dir}/%24.sql"
+# Make both spellings reach the same legacy file on case-sensitive filesystems, too.
+if [[ ! -e "${metadata_dir}/legacylite.sql" ]]; then
+    ln "${metadata_dir}/LegacyLite.sql" "${metadata_dir}/legacylite.sql"
+fi
+
+${CLICKHOUSE_LOCAL} --path "${local_dir}" --multiquery <<'SQL'
+    DROP TYPE CASELITE; -- { serverError UNKNOWN_TYPE }
+    DROP TYPE IF EXISTS CASELITE;
+    CREATE OR REPLACE TYPE CASELITE AS String;
+
+    DROP TYPE legacylite; -- { serverError UNKNOWN_TYPE }
+    DROP TYPE IF EXISTS legacylite;
+    CREATE OR REPLACE TYPE legacylite AS Int64;
+    CREATE OR REPLACE TYPE `$` AS String; -- { serverError BAD_ARGUMENTS }
+
+    CREATE TABLE after_restart (
+        upper_value CaseLite, lower_value caselite, dollar_value persisted$lite_type,
+        variant_value CASELITE, legacy_value LegacyLite, legacy_variant_value legacylite
+    ) ENGINE = Memory;
+    SELECT name, type FROM system.columns
+    WHERE database = currentDatabase() AND table = 'after_restart'
+    ORDER BY position;
+SQL
+
+test "$(cat "${metadata_dir}/%24.sql")" = 'CREATE TYPE `$` AS UInt64'
+${CLICKHOUSE_LOCAL} --path "${local_dir}" --query 'DROP TYPE `$`'
+test ! -e "${metadata_dir}/%24.sql"

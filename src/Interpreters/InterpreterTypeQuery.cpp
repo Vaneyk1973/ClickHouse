@@ -41,7 +41,7 @@ public:
         {
             const auto & drop = query->as<ASTDropTypeQuery &>();
             context_ptr->checkAccess(AccessType::DROP_TYPE);
-            context_ptr->getUserDefinedTypeCatalog().drop(drop.name, drop.if_exists);
+            context_ptr->getUserDefinedTypeCatalog().drop(drop.name, drop.if_exists, context_ptr->getSettingsRef()[Setting::fsync_metadata]);
         }
 
         return {};

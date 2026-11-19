@@ -19,14 +19,13 @@ public:
     explicit UserDefinedTypeCatalog(const String & data_path);
 
     void create(const ASTCreateTypeQuery & query, bool fsync_metadata);
-    void drop(const String & name, bool if_exists);
+    void drop(const String & name, bool if_exists, bool fsync_metadata);
     [[nodiscard]] std::optional<String> tryGetBaseType(const String & name) const;
 
 private:
-    [[nodiscard]] std::filesystem::path getFilePath(const String & name) const;
-
     const std::filesystem::path directory;
     mutable std::mutex mutex;
+    bool directory_entry_synced = false;
 };
 
 }
