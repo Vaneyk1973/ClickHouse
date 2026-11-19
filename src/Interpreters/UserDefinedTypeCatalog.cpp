@@ -108,6 +108,19 @@ DefinitionFile findDefinition(const fs::path & directory, const String & name)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "Type name {} does not match its metadata file {}", backQuote(stored_name), path.string());
 }
 
+void syncCatalogAfterChange(LocalDirectorySyncGuard & directory_sync, const String & name, const char * current_state)
+{
+    try
+    {
+        directory_sync.sync();
+    }
+    catch (Exception & e)
+    {
+        e.addMessage("User-defined type {} {} on this server. Its state after a restart is uncertain", backQuote(name), current_state);
+        throw;
+    }
+}
+
 }
 
 UserDefinedTypeCatalog::UserDefinedTypeCatalog(const String & data_path)
@@ -157,7 +170,7 @@ void UserDefinedTypeCatalog::create(const ASTCreateTypeQuery & query, bool fsync
         else
             renameNoReplace(temporary_path, file_path.string());
         if (directory_sync)
-            directory_sync->sync();
+            syncCatalogAfterChange(*directory_sync, query.name, "has the new definition");
     }
     catch (...)
     {
@@ -185,7 +198,7 @@ void UserDefinedTypeCatalog::drop(const String & name, bool if_exists, bool fsyn
     if (query && !fs::remove(path) && !if_exists)
         throw Exception(ErrorCodes::UNKNOWN_TYPE, "User-defined type {} doesn't exist", backQuote(name));
     if (directory_sync)
-        directory_sync->sync();
+        syncCatalogAfterChange(*directory_sync, name, "is absent");
 }
 
 std::optional<String> UserDefinedTypeCatalog::tryGetBaseType(const String & name) const

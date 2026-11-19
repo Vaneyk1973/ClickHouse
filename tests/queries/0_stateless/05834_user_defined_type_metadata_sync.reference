@@ -1,0 +1,9 @@
+after create	Int64
+after replace	String
+CANNOT_FSYNC
+UNKNOWN_TYPE
+CANNOT_FSYNC User-defined type `LiteSync` has the new definition on this server. Its state after a restart is uncertain
+CANNOT_FSYNC User-defined type `LiteSync` has the new definition on this server. Its state after a restart is uncertain
+CANNOT_FSYNC User-defined type `LiteSync` is absent on this server. Its state after a restart is uncertain
+UNKNOWN_TYPE
+CANNOT_FSYNC User-defined type `LiteSync` is absent on this server. Its state after a restart is uncertain
