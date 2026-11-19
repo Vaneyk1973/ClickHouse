@@ -38,6 +38,9 @@ String similarToPatternToRegexp(std::string_view pattern);
 template <bool is_similar_to = false>
 bool likePatternIsSubstring(std::string_view pattern, String & res);
 
+/// Parses the single ASCII character used as a custom `ESCAPE` argument.
+char parseLikeEscapeCharacter(std::string_view escape, std::string_view function_name);
+
 /// Rewrites a LIKE pattern with custom escape character into a LIKE pattern with standard escape character (backslash).
 /// Example: with escape_char='#': "50#%off" -> "50\%off"
 String likePatternWithCustomEscapeToLikePattern(std::string_view pattern, char escape_char);

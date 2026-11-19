@@ -1,6 +1,7 @@
 #include <Common/likePatternToRegexp.h>
 
 #include <Common/Exception.h>
+#include <Common/StringUtils.h>
 #include <absl/base/attributes.h>
 
 namespace DB
@@ -373,6 +374,16 @@ bool likePatternIsSubstring(std::string_view pattern, String & res)
 
 template bool likePatternIsSubstring<false>(std::string_view pattern, String & res);
 template bool likePatternIsSubstring<true>(std::string_view pattern, String & res);
+
+char parseLikeEscapeCharacter(std::string_view escape, std::string_view function_name)
+{
+    if (escape.size() != 1 || !isASCII(escape[0]))
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "The ESCAPE argument of function {} must be a single ASCII character, got '{}'",
+            function_name, escape);
+    return escape[0];
+}
 
 String likePatternWithCustomEscapeToLikePattern(std::string_view pattern, char escape_char)
 {

@@ -125,7 +125,7 @@ private:
     };
 
     BlockIO createDatabase(ASTCreateQuery & create);
-    BlockIO createTable(ASTCreateQuery & create);
+    BlockIO createTable(ASTCreateQuery & create, const NameSet & type_check_results);
 
     /// Calculate list of columns, constraints, indices, etc... of table. Rewrite query in canonical way.
     TableProperties getTablePropertiesAndNormalizeCreateQuery(ASTCreateQuery & create, LoadingStrictnessLevel mode);

@@ -29,6 +29,8 @@ ${CLICKHOUSE_CLIENT} --multiquery --query "
         default_table_engine = 'Memory', async_insert = 0, ignore_drop_queries_probability = 0;
     CREATE TYPE ${type_name} AS UInt64;
     CREATE TYPE ${checked_type_name} AS Int64 CHECK VALUE > 0;
+    CREATE TABLE ${CLICKHOUSE_DATABASE}.${table_name}_conflict ON CLUSTER test_shard_localhost
+        (positive ${checked_type_name}, \`greater(positive, 0)\` UInt8) FORMAT Null; -- { serverError AMBIGUOUS_COLUMN_NAME }
     CREATE TABLE ${CLICKHOUSE_DATABASE}.${table_name} ON CLUSTER test_shard_localhost
         (value ${type_name}, positive ${checked_type_name}) FORMAT Null;
 

@@ -2175,6 +2175,10 @@ Check expressions support literals, arithmetic, comparisons, Boolean and conditi
 
 Checked declarations apply to physical columns in the `MergeTree` family, `Memory`, `Log`, `TinyLog`, `StripeLog` and `Null`. Use an ordinary table `CHECK` directly when you need to refer to several columns.
 
+When a physical column name matches the computed name of a generated check (for example, `greater(x, 0)` for `CHECK x > 0`), choose a different column name. The table declaration reports the conflict before creating the table.
+
+When exporting a literal column name that resembles a JSON path component, such as `` :`city` ``, the destination must preserve the quoting in its own metadata. ClickHouse 26.10.6.18 accepts the exported SQL but loses those quotes when it stores the check, so it cannot reopen that table.
+
 Use the name as the entire type of a non-nullable column. In expressions, nested types, and `ALTER TABLE`, use the base type. Creating and dropping definitions require the `CREATE TYPE` and `DROP TYPE` privileges respectively. Replacing a definition requires both privileges.
 
 ### Create a table with an existing tables schema {#with-a-schema-similar-to-other-table}

@@ -1,19 +1,24 @@
 #include <Interpreters/validateUserDefinedTypeCheck.h>
 
+#include <Columns/ColumnConst.h>
 #include <Common/Exception.h>
 #include <Common/StringUtils.h>
+#include <Common/VectorWithMemoryTracking.h>
 #include <Common/checkStackSize.h>
+#include <Common/likePatternToRegexp.h>
 #include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Functions/FunctionFactory.h>
+#include <Functions/Regexps.h>
 #include <Functions/UserDefined/UserDefinedExecutableFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/TreeRewriter.h>
 #include <Parsers/ASTCreateTypeQuery.h>
+#include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
@@ -21,6 +26,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <optional>
 #include <string_view>
 
 namespace DB
@@ -117,6 +123,101 @@ ASTPtr bindCheck(const IAST & check, const String & column_name, const ContextPt
     return bound_function;
 }
 
+ActionsDAG analyzeCheck(const ASTPtr & expression, const NamesAndTypesList & columns, const ContextPtr & context)
+{
+    /// Use the native `CHECK` analysis to resolve types and fold constant arguments.
+    auto rewritten = expression->clone();
+    auto syntax = TreeRewriter(context).analyze(rewritten, columns, {},
+        {} /* storage_snapshot */, false /* allow_aggregations */, true /* allow_self_aliases */, false /* execute_scalar_subqueries */);
+    return ExpressionAnalyzer(expression, syntax, context).getActionsDAG(false);
+}
+
+struct StringSearchOptions
+{
+    std::string_view function;
+    ASTPtr pattern;
+    ASTPtr escape;
+};
+
+void collectStringSearchOptions(
+    const IAST & check, ASTExpressionList & expressions, VectorWithMemoryTracking<StringSearchOptions> & searches)
+{
+    checkStackSize();
+    if (const auto * function = check.as<ASTFunction>())
+    {
+        const auto & name = function->name;
+        const auto & args = function->arguments->children;
+        const bool is_like = name == "like" || name == "ilike" || name == "notLike" || name == "notILike";
+        if ((name == "match" && args.size() == 2) || (is_like && (args.size() == 2 || args.size() == 3)))
+        {
+            auto & options = searches.emplace_back(name, args[1]->clone(), args.size() == 3 ? args[2]->clone() : nullptr);
+            expressions.children.push_back(options.pattern);
+            if (options.escape)
+                expressions.children.push_back(options.escape);
+        }
+    }
+
+    for (const auto & child : check.children)
+        collectStringSearchOptions(*child, expressions, searches);
+}
+
+std::optional<String> getConstantString(const ActionsDAG & actions, const IAST & expression)
+{
+    const auto & constant = actions.findInOutputs(expression.getColumnName()).column;
+    if (!constant)
+        return {};
+
+    auto value = constant->getField();
+    if (value.getType() != Field::Types::String)
+        return {};
+
+    return std::move(value).safeGet<String>();
+}
+
+void validateStringSearchOptions(const IAST & check, const NamesAndTypesList & columns, const ContextPtr & context)
+{
+    auto expressions = make_intrusive<ASTExpressionList>();
+    VectorWithMemoryTracking<StringSearchOptions> searches;
+    collectStringSearchOptions(check, *expressions, searches);
+    if (searches.empty())
+        return;
+
+    /// Analyze options independently so a conditional or folded parent cannot hide an invalid constant.
+    /// Keep the typed `VALUE` input available even if rewriting an option prunes its references.
+    expressions->children.push_back(make_intrusive<ASTIdentifier>("VALUE"));
+    const auto actions = analyzeCheck(expressions, columns, context);
+    for (const auto & options : searches)
+    {
+        auto pattern = getConstantString(actions, *options.pattern);
+        if (options.function == "match")
+        {
+            if (pattern)
+                Regexps::createRegexp<false, false, true, false>(*pattern);
+            continue;
+        }
+
+        if (options.escape)
+        {
+            const auto escape = getConstantString(actions, *options.escape);
+            if (!escape)
+                continue;
+            const auto escape_char = parseLikeEscapeCharacter(*escape, options.function);
+            if (pattern)
+                *pattern = likePatternWithCustomEscapeToLikePattern(*pattern, escape_char);
+        }
+
+        /// The native substring path accepts patterns without compiling a regular expression.
+        String substring;
+        if (!pattern || likePatternIsSubstring(*pattern, substring))
+            continue;
+
+        if (options.function == "ilike" || options.function == "notILike")
+            Regexps::createRegexp<true, false, true, true>(*pattern);
+        else
+            Regexps::createRegexp<true, false, true, false>(*pattern);
+    }
+}
+
 }
 
 void validateUserDefinedTypeChecks(const ASTCreateTypeQuery & query, ContextPtr context)
@@ -132,11 +233,8 @@ void validateUserDefinedTypeChecks(const ASTCreateTypeQuery & query, ContextPtr 
     const NamesAndTypesList columns{{"VALUE", DataTypeFactory::instance().get(query.base_type)}};
     for (const auto & check : checks)
     {
-        /// Use the native `CHECK` analysis so constant arguments and result types are resolved as on `INSERT`.
-        auto rewritten = check->clone();
-        auto syntax = TreeRewriter(context).analyze(rewritten, columns, {},
-            {} /* storage_snapshot */, false /* allow_aggregations */, true /* allow_self_aliases */, false /* execute_scalar_subqueries */);
-        auto actions = ExpressionAnalyzer(check, syntax, context).getActionsDAG(false);
+        validateStringSearchOptions(*check, columns, context);
+        auto actions = analyzeCheck(check, columns, context);
         const auto & type = actions.findInOutputs(check->getColumnName()).result_type;
         if (!isUInt8(removeNullable(removeLowCardinality(type))))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "User-defined type CHECK must return UInt8 or Bool, got {}", type->getName());

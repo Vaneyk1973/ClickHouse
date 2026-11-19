@@ -206,6 +206,7 @@ namespace ErrorCodes
     extern const int INCORRECT_QUERY;
     extern const int UNKNOWN_DATABASE_ENGINE;
     extern const int DUPLICATE_COLUMN;
+    extern const int AMBIGUOUS_COLUMN_NAME;
     extern const int DATABASE_ALREADY_EXISTS;
     extern const int BAD_ARGUMENTS;
     extern const int BAD_DATABASE_FOR_TEMPORARY_TABLE;
@@ -295,14 +296,15 @@ void normalizeLegacyToTimeInCreateQuery(ASTPtr & query, const ContextPtr & conte
     replaceLegacyToTime(*query);
 }
 
-bool expandUserDefinedColumnTypes(ASTCreateQuery & create, const ContextPtr & context)
+NameSet expandUserDefinedColumnTypes(ASTCreateQuery & create, const ContextPtr & context)
 {
     if (!create.columns_list || !create.columns_list->columns || create.isView() || create.is_dictionary)
-        return false;
+        return {};
 
     /// Repeated uses of a name in this schema must agree even during a concurrent `CREATE OR REPLACE TYPE`.
     std::unordered_map<String, ASTPtr> resolved_types;
     NameSet constraint_names;
+    NameSet result_names;
     const auto & factory = DataTypeFactory::instance();
     for (const auto & ast : create.columns_list->columns->children)
     {
@@ -351,10 +353,27 @@ bool expandUserDefinedColumnTypes(ASTCreateQuery & create, const ContextPtr & co
             } while (!constraint_names.insert(constraint->name).second);
             constraint->type = ASTConstraintDeclaration::Type::CHECK;
             constraint->set(constraint->expr, bindUserDefinedTypeCheck(*check, column.name));
+            result_names.insert(constraint->expr->getColumnName());
             columns.constraints->children.push_back(std::move(constraint));
         }
     }
-    return !constraint_names.empty();
+    return result_names;
+}
+
+void checkTypeConstraintResultNames(const ASTCreateQuery & create, const NameSet & result_names)
+{
+    if (result_names.empty())
+        return;
+
+    /// A native `CHECK` adds its result to the insert block under the expression's column name.
+    for (const auto & ast : create.columns_list->columns->children)
+    {
+        const auto & column = ast->as<const ASTColumnDeclaration &>();
+        if (column.default_specifier != ColumnDefaultSpecifier::Alias && column.default_specifier != ColumnDefaultSpecifier::Ephemeral
+            && result_names.contains(column.name))
+            throw Exception(ErrorCodes::AMBIGUOUS_COLUMN_NAME,
+                "Physical column {} has the same name as a user-defined type CHECK result", backQuote(column.name));
+    }
 }
 
 }
@@ -2200,7 +2219,7 @@ void releaseQueryStorageSnapshots(const ContextPtr & context)
 
 }
 
-BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create, const NameSet & type_check_results)
 {
     auto component_guard = Coordination::setCurrentComponent("InterpreterCreateQuery::createTable");
     /// Temporary tables are created out of databases.
@@ -2457,6 +2476,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
 
     /// Set and retrieve list of columns, indices and constraints. Set table engine if needed. Rewrite query in canonical way.
     TableProperties properties = getTablePropertiesAndNormalizeCreateQuery(create, mode);
+    checkTypeConstraintResultNames(create, type_check_results);
 
     /// Only here is an engine inherited through `AS` known, and nothing is enqueued or created yet.
     /// A replay of a stored definition was checked when it was created.
@@ -4240,13 +4260,13 @@ BlockIO InterpreterCreateQuery::execute()
 
     bool is_create_database = create.database && !create.table;
 
-    auto resolve_column_types = [this](IAST & ast)
+    auto resolve_column_types = [this](ASTCreateQuery & query) -> NameSet
     {
-        auto & query = ast.as<ASTCreateQuery &>();
         if (!query.table || query.attach || is_restore_from_backup || internal || getContext()->isDDLOrOnClusterInternal())
-            return;
-        if (!expandUserDefinedColumnTypes(query, getContext()))
-            return;
+            return {};
+        auto result_names = expandUserDefinedColumnTypes(query, getContext());
+        if (result_names.empty())
+            return {};
 
         /// Some engines discard constraints or forward inserts around their local constraint transform.
         /// For queued DDL, pin the engine as well as the checks before sending the schema to workers.
@@ -4259,6 +4279,7 @@ BlockIO InterpreterCreateQuery::execute()
         if (!engine.ends_with("MergeTree") && engine != "Memory" && engine != "Log"
             && engine != "TinyLog" && engine != "StripeLog" && engine != "Null")
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Engine {} does not support user-defined types with CHECK", engine);
+        return result_names;
     };
 
     /// In Cloud, a user query can attach a detached table, but cannot create a table from a definition.
@@ -4392,7 +4413,12 @@ BlockIO InterpreterCreateQuery::execute()
 
             /// Older entry formats skip ordinary schema normalization. Resolve type names on the
             /// initiator once `executeDDLQueryOnCluster` has authorized all target databases.
-            return executeQueryOnCluster(create, resolve_column_types);
+            return executeQueryOnCluster(create, [&](IAST & ast)
+            {
+                auto & cluster_query = ast.as<ASTCreateQuery &>();
+                auto result_names = resolve_column_types(cluster_query);
+                checkTypeConstraintResultNames(cluster_query, result_names);
+            });
         }
     }
 
@@ -4403,8 +4429,8 @@ BlockIO InterpreterCreateQuery::execute()
     /// CREATE|ATTACH DATABASE
     if (is_create_database)
         return createDatabase(create);
-    resolve_column_types(create);
-    return createTable(create);
+    auto type_check_results = resolve_column_types(create);
+    return createTable(create, type_check_results);
 }
 
 

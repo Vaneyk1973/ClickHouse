@@ -71,7 +71,6 @@ namespace Setting
 
 namespace ErrorCodes
 {
-    extern const int BAD_ARGUMENTS;
     extern const int ILLEGAL_COLUMN;
 }
 
@@ -357,13 +356,7 @@ public:
                         ErrorCodes::ILLEGAL_COLUMN,
                         "The ESCAPE argument of function {} must be constant",
                         getName());
-                const String escape_str = col_escape->getValue<String>();
-                if (escape_str.size() != 1 || static_cast<unsigned char>(escape_str[0]) > 0x7F)
-                    throw Exception(
-                        ErrorCodes::BAD_ARGUMENTS,
-                        "The ESCAPE argument of function {} must be a single ASCII character, got '{}'",
-                        getName(), escape_str);
-                char escape_char = escape_str[0];
+                const char escape_char = parseLikeEscapeCharacter(col_escape->getValue<String>(), getName());
 
                 /// Rewrite the needle from custom escape to standard backslash escape
                 if (const auto * col_needle_const = typeid_cast<const ColumnConst *>(column_needle.get()))

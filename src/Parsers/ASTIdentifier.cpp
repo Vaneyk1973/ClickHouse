@@ -212,19 +212,6 @@ const String & ASTIdentifier::name() const
 
 void ASTIdentifier::formatImplWithoutAlias(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
 {
-    auto format_element = [&](const String & elem_name)
-    {
-        if (auto special_delimiter_and_identifier = ParserCompoundIdentifier::splitSpecialDelimiterAndIdentifierIfAny(elem_name))
-        {
-            ostr << special_delimiter_and_identifier->first;
-            settings.writeIdentifier(ostr, special_delimiter_and_identifier->second, /*ambiguous=*/false);
-        }
-        else
-        {
-            settings.writeIdentifier(ostr, elem_name, /*ambiguous=*/false);
-        }
-    };
-
     if (compound())
     {
         for (size_t i = 0, j = 0, size = name_parts.size(); i < size; ++i)
@@ -240,8 +227,15 @@ void ASTIdentifier::formatImplWithoutAlias(WriteBuffer & ostr, const FormatSetti
                 children[j]->format(ostr, settings, state, frame);
                 ++j;
             }
+            /// JSON path delimiters can only follow a dot.
+            else if (const auto special_delimiter_and_identifier = i != 0
+                ? ParserCompoundIdentifier::splitSpecialDelimiterAndIdentifierIfAny(name_parts[i]) : std::nullopt)
+            {
+                ostr << special_delimiter_and_identifier->first;
+                settings.writeIdentifier(ostr, special_delimiter_and_identifier->second, /*ambiguous=*/false);
+            }
             else
-                format_element(name_parts[i]);
+                settings.writeIdentifier(ostr, name_parts[i], /*ambiguous=*/false);
         }
     }
     else
@@ -250,7 +244,7 @@ void ASTIdentifier::formatImplWithoutAlias(WriteBuffer & ostr, const FormatSetti
         if (name.empty() && !children.empty())
             children.front()->format(ostr, settings, state, frame);
         else
-            format_element(name);
+            settings.writeIdentifier(ostr, name, /*ambiguous=*/false);
     }
 }
 
